@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from analyze_movement_data import MovementDataAnalyzer
 from kalman_ssa_interpolator import KalmanSSAInterpolator
+from neural_interpolator import NeuralInterpolator
 
 # Page config - MUST be first Streamlit command
 st.set_page_config(
@@ -86,6 +87,15 @@ def load_analyzer():
 def load_kalman_interpolator():
     """Load the Kalman+SSA Interpolator (Olympic-grade) with global models"""
     return KalmanSSAInterpolator(sampling_rate=50, ssa_window=40, use_global_models=True)
+
+@st.cache_resource
+def load_neural_interpolator():
+    """Load the Neural Network Interpolator"""
+    interpolator = NeuralInterpolator(model_path="neural_interpolator_model.pt")
+    if interpolator.is_trained:
+        return interpolator
+    else:
+        return None
 
 @st.cache_data
 def load_file_list(_analyzer):
@@ -450,6 +460,7 @@ def main():
     try:
         analyzer = load_analyzer()
         kalman_interpolator = load_kalman_interpolator()
+        neural_interpolator = load_neural_interpolator()
         df = load_file_list(analyzer)
     except Exception as e:
         st.error(f"Fehler beim Laden der Daten: {e}")
@@ -524,13 +535,21 @@ def main():
         st.caption(f"📌 Ausgewählt: {selected_file['Athlet']} - Versuch {selected_file['Versuch']}")
     
     with col_right:
-        # Header with toggle
-        col_header1, col_header2 = st.columns([2, 1])
+        # Header with method selection
+        col_header1, col_header2, col_header3 = st.columns([2, 1, 1])
         with col_header1:
             st.subheader("📊 Detailanalyse")
         with col_header2:
-            st.markdown("<br>", unsafe_allow_html=True)
-            show_interpolation = st.toggle("🏅 Kalman+SSA", value=True, help="Olympic-grade Interpolation (Kalman Filter + SSA)")
+            interpolation_method = st.radio(
+                "Interpolation",
+                options=["Keine", "🏅 Kalman+SSA", "🧠 Neural Network"],
+                index=1,
+                horizontal=True,
+                help="Wähle die Interpolationsmethode"
+            )
+        
+        show_interpolation = interpolation_method != "Keine"
+        use_neural_network = interpolation_method == "🧠 Neural Network"
         
         try:
             # Load selected file
@@ -539,17 +558,24 @@ def main():
             gap_analysis = analyzer.analyze_gaps_until_takeoff(filepath)
             gaps = gap_analysis['gaps']
             
-            # Kalman+SSA interpolation (Olympic-grade)
+            # Interpolation (Kalman+SSA or Neural Network)
             interpolated_data = data
             interpolation_ranges = []
             interpolation_info = []
             
-            if show_interpolation and kalman_interpolator and len(gaps) > 0:
+            if show_interpolation and len(gaps) > 0:
                 try:
-                    # Use Kalman+SSA to FILL gaps (inserts new points!)
-                    interpolated_data, interpolation_info = kalman_interpolator.fill_all_gaps(
-                        data, gaps
-                    )
+                    if use_neural_network and neural_interpolator:
+                        # Neural Network Interpolation
+                        interpolated_data, interpolation_info = neural_interpolator.fill_all_gaps(
+                            data, gaps
+                        )
+                    elif kalman_interpolator:
+                        # Kalman+SSA Interpolation (Olympic-grade)
+                        interpolated_data, interpolation_info = kalman_interpolator.fill_all_gaps(
+                            data, gaps
+                        )
+                    
                     # Create ranges for visualization
                     for info in interpolation_info:
                         interpolation_ranges.append((info['start_idx'], info['end_idx']))
@@ -571,20 +597,24 @@ def main():
             
             st.markdown(f'<div class="status-badge {badge_class}">{badge_text}</div>', unsafe_allow_html=True)
             
-            # Gap badge with Kalman+SSA info
+            # Gap badge with interpolation info
             num_gaps = len(gaps)
             if num_gaps > 0:
                 if show_interpolation and interpolation_info:
                     total_points_added = sum(info['num_points'] for info in interpolation_info)
                     avg_confidence = np.mean([info['confidence'] for info in interpolation_info])
                     
-                    st.success(f"🏅 Kalman+SSA: {num_gaps} Lücke(n) GEFÜLLT ({total_points_added} Punkte eingefügt) • Ø Confidence: {avg_confidence:.0%}")
+                    if use_neural_network:
+                        st.success(f"🧠 Neural Network: {num_gaps} Lücke(n) GEFÜLLT ({total_points_added} Punkte) • Ø Confidence: {avg_confidence:.0%}")
+                    else:
+                        st.success(f"🏅 Kalman+SSA: {num_gaps} Lücke(n) GEFÜLLT ({total_points_added} Punkte) • Ø Confidence: {avg_confidence:.0%}")
                 else:
                     st.warning(f"⚠️ {num_gaps} Datenlücke(n) detektiert")
             else:
                 st.success("✅ Keine Datenlücken")
             
-            st.caption(f"Sampling Rate: {analyzer.sampling_rate} Hz | Absprung: {takeoff_point/1000:.2f}m | Original: {len(data)} → Interpoliert: {len(interpolated_data)}")
+            method_name = "Neural Network" if use_neural_network else "Kalman+SSA"
+            st.caption(f"Sampling Rate: {analyzer.sampling_rate} Hz | Absprung: {takeoff_point/1000:.2f}m | {method_name}: {len(data)} → {len(interpolated_data)} Punkte")
             
             # Plot
             fig = create_plot(analyzer, data, takeoff_point, athlete_name, attempt_num, interpolated_data, interpolation_ranges, gaps, show_interpolation)
