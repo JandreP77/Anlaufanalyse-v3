@@ -155,7 +155,7 @@ class KalmanSSAInterpolator:
     def interpolate_gap(self, data: np.ndarray, gap_start: int, gap_end: int, 
                        gap_size_mm: float) -> Tuple[np.ndarray, float]:
         """
-        Interpolate a single gap
+        Interpolate a single gap - CONSTRAINED to be between start and end values!
         
         Args:
             data: Full distance array (in mm)
@@ -168,26 +168,113 @@ class KalmanSSAInterpolator:
         """
         gap_size_m = gap_size_mm / 1000
         
-        # Determine number of points to insert
-        expected_step = 180  # mm per frame (conservative estimate)
+        # Get start and end values (THESE ARE THE CONSTRAINTS!)
+        start_value = data[gap_start]
+        end_value = data[gap_end] if gap_end < len(data) else data[-1]
+        
+        # Determine number of points to insert based on expected velocity
+        # At ~8 m/s and 50Hz = ~160mm per frame
+        expected_step = 160  # mm per frame
         num_points = max(1, int(gap_size_mm / expected_step))
         
-        # Select method based on gap size
+        # ALWAYS use constrained interpolation to ensure values are valid!
+        return self._constrained_interpolate(data, gap_start, gap_end, num_points, start_value, end_value, gap_size_m)
+    
+    def _constrained_interpolate(self, data: np.ndarray, gap_start: int, 
+                                   gap_end: int, num_points: int,
+                                   start_value: float, end_value: float,
+                                   gap_size_m: float) -> Tuple[np.ndarray, float]:
+        """
+        CONSTRAINED interpolation - values MUST be between start and end!
+        Uses cubic spline with biomechanical step pattern overlay.
+        
+        This ensures:
+        1. Values start at start_value and end near end_value
+        2. Values are monotonically increasing (athlete runs forward!)
+        3. No negative or impossible values
+        """
+        # Method 1: Simple linear interpolation as baseline
+        linear_interp = np.linspace(start_value, end_value, num_points + 2)[1:-1]
+        
+        # Method 2: Try cubic spline for smoother curve
+        try:
+            context_size = min(10, gap_start, len(data) - gap_end - 1)
+            if context_size >= 3:
+                x_known = np.concatenate([
+                    np.arange(gap_start - context_size, gap_start + 1),
+                    np.arange(gap_end, min(gap_end + context_size + 1, len(data)))
+                ])
+                y_known = np.concatenate([
+                    data[gap_start - context_size:gap_start + 1],
+                    data[gap_end:min(gap_end + context_size + 1, len(data))]
+                ])
+                
+                # Fit cubic spline
+                cs = CubicSpline(x_known, y_known)
+                
+                # Interpolate at new positions
+                x_new = np.linspace(gap_start + 0.5, gap_end - 0.5, num_points)
+                spline_interp = cs(x_new)
+                
+                # CONSTRAIN: Ensure values are between start and end
+                min_allowed = min(start_value, end_value)
+                max_allowed = max(start_value, end_value)
+                spline_interp = np.clip(spline_interp, min_allowed, max_allowed)
+                
+                # CONSTRAIN: Ensure monotonically increasing
+                for i in range(1, len(spline_interp)):
+                    if spline_interp[i] < spline_interp[i-1]:
+                        spline_interp[i] = spline_interp[i-1] + (end_value - start_value) / num_points
+                
+                # Use spline if it looks reasonable
+                if np.all(spline_interp >= min_allowed) and np.all(spline_interp <= max_allowed):
+                    interpolated = spline_interp
+                else:
+                    interpolated = linear_interp
+            else:
+                interpolated = linear_interp
+        except:
+            interpolated = linear_interp
+        
+        # Add slight biomechanical variation (step pattern)
+        # Typical step frequency: ~4 Hz at sprint speed
+        step_freq = 4.0  # Hz
+        frames_per_step = self.sampling_rate / step_freq
+        
+        # Small sinusoidal variation (~2% of step size)
+        step_size = (end_value - start_value) / num_points if num_points > 0 else 0
+        variation_amplitude = abs(step_size) * 0.02
+        
+        t = np.arange(num_points)
+        variation = variation_amplitude * np.sin(2 * np.pi * t / frames_per_step)
+        
+        interpolated = interpolated + variation
+        
+        # FINAL CONSTRAINT: Ensure monotonically increasing and in bounds
+        min_allowed = min(start_value, end_value)
+        max_allowed = max(start_value, end_value)
+        interpolated = np.clip(interpolated, min_allowed, max_allowed)
+        
+        # Ensure monotonicity
+        for i in range(1, len(interpolated)):
+            if interpolated[i] < interpolated[i-1]:
+                interpolated[i] = interpolated[i-1]
+        
+        # Calculate confidence based on gap size
         if gap_size_m < 1.0:
-            # Small gap: Cubic Spline
-            return self._cubic_spline_interpolate(data, gap_start, gap_end, num_points)
-        
+            confidence = 0.95
         elif gap_size_m < 5.0:
-            # Medium gap: Kalman Filter
-            return self._kalman_interpolate(data, gap_start, gap_end, num_points)
-        
+            confidence = 0.85
+        elif gap_size_m < 10.0:
+            confidence = 0.75
         else:
-            # Large gap: Kalman + SSA Hybrid
-            return self._hybrid_interpolate(data, gap_start, gap_end, num_points)
+            confidence = 0.65
+        
+        return interpolated, confidence
     
     def _cubic_spline_interpolate(self, data: np.ndarray, gap_start: int, 
                                   gap_end: int, num_points: int) -> Tuple[np.ndarray, float]:
-        """Cubic spline interpolation for small gaps"""
+        """Cubic spline interpolation for small gaps (LEGACY - use _constrained_interpolate)"""
         # Use points around gap
         context_size = min(20, gap_start, len(data) - gap_end - 1)
         x_known = np.concatenate([
@@ -205,6 +292,11 @@ class KalmanSSAInterpolator:
         # Interpolate
         x_new = np.linspace(gap_start + 1, gap_end, num_points, endpoint=False)
         y_new = cs(x_new)
+        
+        # CONSTRAIN to valid range
+        start_value = data[gap_start]
+        end_value = data[gap_end] if gap_end < len(data) else data[-1]
+        y_new = np.clip(y_new, min(start_value, end_value), max(start_value, end_value))
         
         # High confidence for small gaps
         confidence = 0.95
