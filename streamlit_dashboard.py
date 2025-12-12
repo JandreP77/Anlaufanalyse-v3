@@ -8,6 +8,7 @@ from plotly.subplots import make_subplots
 from analyze_movement_data import MovementDataAnalyzer
 from kalman_ssa_interpolator import KalmanSSAInterpolator
 from neural_interpolator import NeuralInterpolator
+from data_cleaner import DataCleaner
 
 # Page config - MUST be first Streamlit command
 st.set_page_config(
@@ -96,6 +97,11 @@ def load_neural_interpolator():
         return interpolator
     else:
         return None
+
+@st.cache_resource
+def load_data_cleaner():
+    """Load the Data Cleaner for removing measurement errors"""
+    return DataCleaner(max_backward_mm=500, min_forward_velocity=2.0)
 
 @st.cache_data
 def load_file_list(_analyzer):
@@ -266,7 +272,7 @@ def analyze_zone(analyzer, data, takeoff_point, zone_start, zone_end):
         return None
 
 def create_plot(analyzer, data, takeoff_point, athlete_name, attempt_num, interpolated_data, interpolation_ranges, gaps, show_interpolation=False):
-    """Create interactive plotly figure"""
+    """Create interactive plotly figure with cleaned data"""
     fig = make_subplots(
         rows=2, cols=1,
         subplot_titles=('Distanz-Profil', 'Geschwindigkeits-Profil'),
@@ -274,10 +280,20 @@ def create_plot(analyzer, data, takeoff_point, athlete_name, attempt_num, interp
         row_heights=[0.5, 0.5]
     )
     
-    # Data to plot (interpolated if available)
-    plot_data = interpolated_data if show_interpolation and len(interpolated_data) > len(data) else data
-    data_label = 'Interpoliert (Kalman+SSA)' if show_interpolation and len(interpolated_data) > len(data) else 'Messdaten'
-    data_color = '#28a745' if show_interpolation and len(interpolated_data) > len(data) else 'blue'
+    # Show original data as light gray dashed line (for comparison)
+    if show_interpolation:
+        fig.add_trace(go.Scatter(
+            y=[d/1000 for d in data],
+            name='Original (mit Fehlern)', 
+            line=dict(color='lightgray', width=1, dash='dot'),
+            hovertemplate='Frame: %{x}<br>Original: %{y:.2f} m<extra></extra>',
+            opacity=0.5
+        ), row=1, col=1)
+    
+    # Data to plot (cleaned if available)
+    plot_data = interpolated_data if show_interpolation else data
+    data_label = 'Bereinigt' if show_interpolation else 'Messdaten'
+    data_color = '#28a745' if show_interpolation else 'blue'
     
     fig.add_trace(go.Scatter(
         y=[d/1000 for d in plot_data],  # Convert to meters
@@ -286,13 +302,13 @@ def create_plot(analyzer, data, takeoff_point, athlete_name, attempt_num, interp
         hovertemplate='Frame: %{x}<br>Distanz: %{y:.2f} m<extra></extra>'
     ), row=1, col=1)
     
-    # Show interpolated regions
+    # Show interpolated/cleaned regions
     if show_interpolation and interpolation_ranges:
         for (start, end) in interpolation_ranges:
             fig.add_vrect(
                 x0=start, x1=end,
                 fillcolor='#a259d9',
-                opacity=0.15,
+                opacity=0.2,
                 line_width=0,
                 row=1, col=1
             )
@@ -301,11 +317,11 @@ def create_plot(analyzer, data, takeoff_point, athlete_name, attempt_num, interp
             x=[None], y=[None],
             mode='markers',
             marker=dict(size=10, color='#a259d9'),
-            name='Interpolierte Bereiche',
+            name='Bereinigte Bereiche',
             showlegend=True
         ), row=1, col=1)
     
-    # Mark original gap positions (only if NOT showing interpolation)
+    # Mark problem areas (only if NOT showing cleaning)
     if gaps and not show_interpolation:
         gap_legend_added = False
         
@@ -320,7 +336,7 @@ def create_plot(analyzer, data, takeoff_point, athlete_name, attempt_num, interp
                 line_width=2,
                 opacity=0.6,
                 row=1, col=1,
-                annotation_text=f"Lücke: {gap_size_m:.1f}m",
+                annotation_text=f"Fehler: {gap_size_m:.1f}m",
                 annotation_position="top"
             )
             
@@ -337,7 +353,7 @@ def create_plot(analyzer, data, takeoff_point, athlete_name, attempt_num, interp
                     x=[None], y=[None],
                     mode='lines',
                     line=dict(color='red', width=2, dash='dash'),
-                    name='Datenlücke',
+                    name='Messfehler',
                     showlegend=True
                 ), row=1, col=1)
                 gap_legend_added = True
@@ -461,6 +477,7 @@ def main():
         analyzer = load_analyzer()
         kalman_interpolator = load_kalman_interpolator()
         neural_interpolator = load_neural_interpolator()
+        data_cleaner = load_data_cleaner()
         df = load_file_list(analyzer)
     except Exception as e:
         st.error(f"Fehler beim Laden der Daten: {e}")
@@ -535,21 +552,16 @@ def main():
         st.caption(f"📌 Ausgewählt: {selected_file['Athlet']} - Versuch {selected_file['Versuch']}")
     
     with col_right:
-        # Header with method selection
-        col_header1, col_header2, col_header3 = st.columns([2, 1, 1])
+        # Header with data cleaning toggle
+        col_header1, col_header2 = st.columns([2, 1])
         with col_header1:
             st.subheader("📊 Detailanalyse")
         with col_header2:
-            interpolation_method = st.radio(
-                "Interpolation",
-                options=["Keine", "🏅 Kalman+SSA", "🧠 Neural Network"],
-                index=1,
-                horizontal=True,
-                help="Wähle die Interpolationsmethode"
+            show_interpolation = st.toggle(
+                "🧹 Daten bereinigen",
+                value=True,
+                help="Entfernt Messfehler (Rückwärtsbewegungen) und interpoliert Lücken"
             )
-        
-        show_interpolation = interpolation_method != "Keine"
-        use_neural_network = interpolation_method == "🧠 Neural Network"
         
         try:
             # Load selected file
@@ -558,29 +570,37 @@ def main():
             gap_analysis = analyzer.analyze_gaps_until_takeoff(filepath)
             gaps = gap_analysis['gaps']
             
-            # Interpolation (Kalman+SSA or Neural Network)
+            # Data Cleaning + Interpolation (removes measurement errors, then interpolates)
             interpolated_data = data
             interpolation_ranges = []
             interpolation_info = []
             
-            if show_interpolation and len(gaps) > 0:
+            if show_interpolation and data_cleaner:
                 try:
-                    if use_neural_network and neural_interpolator:
-                        # Neural Network Interpolation
-                        interpolated_data, interpolation_info = neural_interpolator.fill_all_gaps(
-                            data, gaps
-                        )
-                    elif kalman_interpolator:
-                        # Kalman+SSA Interpolation (Olympic-grade)
-                        interpolated_data, interpolation_info = kalman_interpolator.fill_all_gaps(
-                            data, gaps
-                        )
+                    # Use Data Cleaner: removes backward jumps (measurement errors) and interpolates
+                    cleaned_data, gaps_info, removed_indices = data_cleaner.clean_and_interpolate(
+                        data, sampling_rate=analyzer.sampling_rate or 50
+                    )
                     
-                    # Create ranges for visualization
-                    for info in interpolation_info:
-                        interpolation_ranges.append((info['start_idx'], info['end_idx']))
+                    interpolated_data = cleaned_data
+                    
+                    # Convert gaps_info to interpolation_info format
+                    for gap in gaps_info:
+                        interpolation_info.append({
+                            'index': gap['start_idx'],
+                            'size_mm': gap['gap_size_mm'],
+                            'size_m': gap['gap_size_mm'] / 1000,
+                            'num_points': gap['end_idx'] - gap['start_idx'],
+                            'confidence': 0.85,  # High confidence for cleaned data
+                            'method': 'Data Cleaner (Fehlerbereinigung)',
+                            'start_idx': gap['start_idx'],
+                            'end_idx': gap['end_idx'],
+                            'removed_points': gap.get('removed_points', 0)
+                        })
+                        interpolation_ranges.append((gap['start_idx'], gap['end_idx']))
+                    
                 except Exception as e:
-                    st.warning(f"Interpolation fehlgeschlagen: {e}")
+                    st.warning(f"Datenbereinigung fehlgeschlagen: {e}")
                     interpolated_data = data
             
             # Status badge
@@ -597,24 +617,20 @@ def main():
             
             st.markdown(f'<div class="status-badge {badge_class}">{badge_text}</div>', unsafe_allow_html=True)
             
-            # Gap badge with interpolation info
+            # Gap badge with cleaning info
             num_gaps = len(gaps)
-            if num_gaps > 0:
-                if show_interpolation and interpolation_info:
-                    total_points_added = sum(info['num_points'] for info in interpolation_info)
-                    avg_confidence = np.mean([info['confidence'] for info in interpolation_info])
-                    
-                    if use_neural_network:
-                        st.success(f"🧠 Neural Network: {num_gaps} Lücke(n) GEFÜLLT ({total_points_added} Punkte) • Ø Confidence: {avg_confidence:.0%}")
-                    else:
-                        st.success(f"🏅 Kalman+SSA: {num_gaps} Lücke(n) GEFÜLLT ({total_points_added} Punkte) • Ø Confidence: {avg_confidence:.0%}")
-                else:
-                    st.warning(f"⚠️ {num_gaps} Datenlücke(n) detektiert")
+            if show_interpolation and interpolation_info:
+                total_removed = sum(info.get('removed_points', 0) for info in interpolation_info)
+                num_regions = len(interpolation_info)
+                
+                st.success(f"🧹 Daten bereinigt: {total_removed} Messfehler entfernt, {num_regions} Region(en) interpoliert")
+            elif num_gaps > 0:
+                st.warning(f"⚠️ {num_gaps} Datenlücke(n) / Messfehler detektiert")
             else:
-                st.success("✅ Keine Datenlücken")
+                st.success("✅ Keine Datenlücken oder Messfehler")
             
-            method_name = "Neural Network" if use_neural_network else "Kalman+SSA"
-            st.caption(f"Sampling Rate: {analyzer.sampling_rate} Hz | Absprung: {takeoff_point/1000:.2f}m | {method_name}: {len(data)} → {len(interpolated_data)} Punkte")
+            cleaning_status = "Bereinigt" if show_interpolation else "Original"
+            st.caption(f"Sampling Rate: {analyzer.sampling_rate} Hz | Absprung: {takeoff_point/1000:.2f}m | {cleaning_status}: {len(data)} Punkte")
             
             # Plot
             fig = create_plot(analyzer, data, takeoff_point, athlete_name, attempt_num, interpolated_data, interpolation_ranges, gaps, show_interpolation)
@@ -656,11 +672,27 @@ def main():
                 else:
                     st.info("Keine Daten verfügbar")
             
-            # Gaps table with interpolation info
-            if gaps:
-                st.markdown("### 🔍 Lücken-Details")
+            # Cleaning/Gaps details table
+            if interpolation_info and show_interpolation:
+                st.markdown("### 🧹 Bereinigungsdetails")
+                cleaning_data = []
+                for info in interpolation_info:
+                    row = {
+                        'Start (m)': f"{info.get('start_value', info['index'])/1000:.2f}" if 'start_value' in info else f"Index {info['start_idx']}",
+                        'Ende (m)': f"{info.get('end_value', 0)/1000:.2f}" if 'end_value' in info else f"Index {info['end_idx']}",
+                        'Größe (m)': f"{info['size_m']:.2f}",
+                        'Entfernt': f"{info.get('removed_points', 0)} Punkte",
+                        'Interpoliert': f"{info['num_points']} Punkte",
+                        'Confidence': f"{info['confidence']:.0%}",
+                        'Methode': info['method']
+                    }
+                    cleaning_data.append(row)
+                
+                st.dataframe(pd.DataFrame(cleaning_data), use_container_width=True, hide_index=True)
+            elif gaps:
+                st.markdown("### ⚠️ Erkannte Fehler/Lücken")
                 gap_data = []
-                for i, g in enumerate(gaps):
+                for g in gaps:
                     zone = ''
                     if g.get('zone_6_1'):
                         zone = '🔴 6-1m (kritisch)'
@@ -676,19 +708,11 @@ def main():
                         'Größe (m)': f"{g['difference']/1000:.2f}",
                         'Zone': zone
                     }
-                    
-                    # Add Kalman+SSA interpolation info if available
-                    if show_interpolation and interpolation_info and i < len(interpolation_info):
-                        info = interpolation_info[i]
-                        row['Eingefügt'] = f"{info['num_points']} Punkte"
-                        row['Confidence'] = f"{info['confidence']:.0%}"
-                        row['Methode'] = info['method']
-                    
                     gap_data.append(row)
                 
                 st.dataframe(pd.DataFrame(gap_data), use_container_width=True, hide_index=True)
             else:
-                st.success("✅ Keine Lücken detektiert!")
+                st.success("✅ Keine Fehler oder Lücken detektiert!")
         
         except Exception as e:
             st.error(f"Fehler beim Laden der Datei: {e}")
