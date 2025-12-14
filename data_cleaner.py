@@ -16,6 +16,26 @@ Beispiel Brinkmann-1:
 
 import numpy as np
 from typing import List, Tuple, Dict, Any
+import json
+from pathlib import Path
+
+# #region agent log
+DEBUG_LOG_PATH = Path('/Users/andreparduhn/Documents/OSP_New/.cursor/debug.log')
+def _debug_log(location: str, message: str, data: dict, hypothesis_id: str = ""):
+    try:
+        log_entry = {
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": __import__('time').time() * 1000,
+            "sessionId": "debug-session",
+            "hypothesisId": hypothesis_id
+        }
+        with open(DEBUG_LOG_PATH, 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+    except:
+        pass
+# #endregion
 
 
 class DataCleaner:
@@ -52,6 +72,16 @@ class DataCleaner:
         """
         data_array = np.array(data, dtype=np.float64)
         n = len(data_array)
+        
+        # #region agent log
+        _debug_log("data_cleaner.py:clean_and_interpolate:ENTRY", "Function entry", {
+            "data_length": n,
+            "data_min": float(np.min(data_array)) if n > 0 else 0,
+            "data_max": float(np.max(data_array)) if n > 0 else 0,
+            "sampling_rate": sampling_rate,
+            "max_backward_mm": self.max_backward_mm
+        }, "A")
+        # #endregion
         
         # Schritt 1: Finde fehlerhafte Bereiche (Werte DEUTLICH unter dem bisherigen Maximum)
         valid_mask = np.ones(n, dtype=bool)
@@ -101,6 +131,14 @@ class DataCleaner:
         if in_error:
             error_regions.append((error_start, n))
         
+        # #region agent log
+        _debug_log("data_cleaner.py:clean_and_interpolate:AFTER_ERROR_DETECTION", "After error detection", {
+            "removed_indices_count": len(removed_indices),
+            "error_regions_count": len(error_regions),
+            "error_regions": error_regions[:5] if error_regions else []  # First 5
+        }, "A")
+        # #endregion
+        
         # Schritt 3: Erstelle bereinigte Daten mit Interpolation
         cleaned_data = data_array.copy()
         gaps_info = []
@@ -143,14 +181,8 @@ class DataCleaner:
                 
                 # Ersetze Fehlerwerte
                 cleaned_data[valid_before + 1:valid_after] = interpolated
-        
-        # Schritt 4: Finale Glättung - entferne kleine Rückwärtsbewegungen (Messrauschen)
-        # Das ist optional, macht die Kurve aber sauberer
-        for i in range(1, len(cleaned_data)):
-            if cleaned_data[i] < cleaned_data[i-1]:
-                # Kleine Rückwärtsbewegung (Rauschen) → setze auf vorherigen Wert
-                cleaned_data[i] = cleaned_data[i-1]
                 
+                # BUG FIX: gaps_info muss hier gefüllt werden, nicht in der Glättungsschleife!
                 gaps_info.append({
                     'type': 'error_region',
                     'start_idx': valid_before + 1,
@@ -159,8 +191,26 @@ class DataCleaner:
                     'end_value': end_value,
                     'gap_size_mm': gap_size_mm,
                     'original_points': region_end - region_start,
-                    'removed_points': sum(1 for i in range(region_start, region_end) if not valid_mask[i])
+                    'removed_points': sum(1 for idx in range(region_start, region_end) if not valid_mask[idx])
                 })
+        
+        # Schritt 4: Finale Glättung - entferne kleine Rückwärtsbewegungen (Messrauschen)
+        # Das ist optional, macht die Kurve aber sauberer
+        smoothed_count = 0
+        for i in range(1, len(cleaned_data)):
+            if cleaned_data[i] < cleaned_data[i-1]:
+                # Kleine Rückwärtsbewegung (Rauschen) → setze auf vorherigen Wert
+                cleaned_data[i] = cleaned_data[i-1]
+                smoothed_count += 1
+        
+        # #region agent log
+        _debug_log("data_cleaner.py:clean_and_interpolate:EXIT", "Function exit", {
+            "gaps_info_count": len(gaps_info),
+            "smoothed_count": smoothed_count,
+            "output_length": len(cleaned_data),
+            "is_monotonic": bool(all(cleaned_data[i] <= cleaned_data[i+1] for i in range(len(cleaned_data)-1)))
+        }, "A")
+        # #endregion
         
         return cleaned_data, gaps_info, removed_indices
     

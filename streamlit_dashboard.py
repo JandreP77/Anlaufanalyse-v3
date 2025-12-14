@@ -9,6 +9,26 @@ from analyze_movement_data import MovementDataAnalyzer
 from kalman_ssa_interpolator import KalmanSSAInterpolator
 from neural_interpolator import NeuralInterpolator
 from data_cleaner import DataCleaner
+import json
+from pathlib import Path
+
+# #region agent log
+DEBUG_LOG_PATH = Path('/Users/andreparduhn/Documents/OSP_New/.cursor/debug.log')
+def _debug_log(location: str, message: str, data: dict, hypothesis_id: str = ""):
+    try:
+        log_entry = {
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": __import__('time').time() * 1000,
+            "sessionId": "debug-session",
+            "hypothesisId": hypothesis_id
+        }
+        with open(DEBUG_LOG_PATH, 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+    except:
+        pass
+# #endregion
 
 # Page config - MUST be first Streamlit command
 st.set_page_config(
@@ -152,6 +172,14 @@ def load_file_list(_analyzer):
 
 def calculate_quality_metrics(analyzer, data, takeoff_point, ssa_filled, ssa_ranges):
     """Calculate quality metrics"""
+    # #region agent log
+    _debug_log("streamlit_dashboard.py:calculate_quality_metrics:ENTRY", "Calculating quality metrics", {
+        "data_length": len(data) if data is not None else 0,
+        "takeoff_point": takeoff_point,
+        "ssa_filled_length": len(ssa_filled) if ssa_filled is not None else 0,
+        "ssa_ranges_count": len(ssa_ranges) if ssa_ranges else 0
+    }, "B")
+    # #endregion
     try:
         # Interpolation quality
         if ssa_ranges:
@@ -552,16 +580,23 @@ def main():
         st.caption(f"📌 Ausgewählt: {selected_file['Athlet']} - Versuch {selected_file['Versuch']}")
     
     with col_right:
-        # Header with data cleaning toggle
+        # Header with interpolation method selection
         col_header1, col_header2 = st.columns([2, 1])
         with col_header1:
             st.subheader("📊 Detailanalyse")
         with col_header2:
-            show_interpolation = st.toggle(
-                "🧹 Daten bereinigen",
-                value=True,
-                help="Entfernt Messfehler (Rückwärtsbewegungen) und interpoliert Lücken"
+            interpolation_method = st.selectbox(
+                "🔧 Interpolationsmethode",
+                options=[
+                    "Keine", 
+                    "Data Cleaner (linear)", 
+                    "Data Cleaner + Kalman+SSA", 
+                    "Data Cleaner + Neural"
+                ],
+                index=2,  # Default: Data Cleaner + Kalman+SSA
+                help="Alle Methoden bereinigen erst Messfehler, dann interpolieren"
             )
+            show_interpolation = interpolation_method != "Keine"
         
         try:
             # Load selected file
@@ -575,32 +610,175 @@ def main():
             interpolation_ranges = []
             interpolation_info = []
             
-            if show_interpolation and data_cleaner:
+            if show_interpolation:
                 try:
-                    # Use Data Cleaner: removes backward jumps (measurement errors) and interpolates
-                    cleaned_data, gaps_info, removed_indices = data_cleaner.clean_and_interpolate(
-                        data, sampling_rate=analyzer.sampling_rate or 50
-                    )
+                    # SCHRITT 1: Immer zuerst Data Cleaner für Messfehler-Bereinigung
+                    if data_cleaner:
+                        cleaned_data, cleaner_gaps_info, removed_indices = data_cleaner.clean_and_interpolate(
+                            data, sampling_rate=analyzer.sampling_rate or 50
+                        )
+                        
+                        # #region agent log
+                        _debug_log("streamlit_dashboard.py:AFTER_DATA_CLEAN", "Data cleaning completed", {
+                            "filepath": filepath,
+                            "method": interpolation_method,
+                            "original_length": len(data),
+                            "cleaned_length": len(cleaned_data),
+                            "removed_count": len(removed_indices),
+                            "cleaner_gaps": len(cleaner_gaps_info)
+                        }, "E")
+                        # #endregion
+                    else:
+                        cleaned_data = np.array(data)
+                        cleaner_gaps_info = []
+                        removed_indices = []
                     
-                    interpolated_data = cleaned_data
+                    # SCHRITT 2: Je nach Methode interpolieren
+                    if interpolation_method == "Data Cleaner (linear)":
+                        # Nur Data Cleaner (lineare Interpolation bereits gemacht)
+                        interpolated_data = cleaned_data
+                        
+                        for gap in cleaner_gaps_info:
+                            interpolation_info.append({
+                                'index': gap['start_idx'],
+                                'size_mm': gap['gap_size_mm'],
+                                'size_m': gap['gap_size_mm'] / 1000,
+                                'num_points': gap['end_idx'] - gap['start_idx'],
+                                'confidence': 0.80,
+                                'method': 'Linear (Data Cleaner)',
+                                'start_idx': gap['start_idx'],
+                                'end_idx': gap['end_idx'],
+                                'removed_points': gap.get('removed_points', 0)
+                            })
+                            interpolation_ranges.append((gap['start_idx'], gap['end_idx']))
                     
-                    # Convert gaps_info to interpolation_info format
-                    for gap in gaps_info:
-                        interpolation_info.append({
-                            'index': gap['start_idx'],
-                            'size_mm': gap['gap_size_mm'],
-                            'size_m': gap['gap_size_mm'] / 1000,
-                            'num_points': gap['end_idx'] - gap['start_idx'],
-                            'confidence': 0.85,  # High confidence for cleaned data
-                            'method': 'Data Cleaner (Fehlerbereinigung)',
-                            'start_idx': gap['start_idx'],
-                            'end_idx': gap['end_idx'],
-                            'removed_points': gap.get('removed_points', 0)
-                        })
-                        interpolation_ranges.append((gap['start_idx'], gap['end_idx']))
+                    elif interpolation_method == "Data Cleaner + Kalman+SSA" and kalman_interpolator:
+                        # Data Cleaner hat fehlerhafte Bereiche identifiziert
+                        # JETZT: Kalman+SSA ERSETZT die lineare Interpolation mit besserer Interpolation
+                        
+                        if cleaner_gaps_info:
+                            # Starte mit bereinigten Daten
+                            interpolated_data = np.array(cleaned_data)
+                            
+                            for gap in cleaner_gaps_info:
+                                start_idx = gap['start_idx']
+                                end_idx = gap['end_idx']
+                                start_value = gap['start_value']
+                                end_value = gap['end_value']
+                                gap_size_mm = abs(end_value - start_value)
+                                num_points = end_idx - start_idx
+                                
+                                # Verwende Kalman-Interpolation für diesen Bereich
+                                # Interpoliere zwischen start_value und end_value
+                                kalman_interp, confidence = kalman_interpolator.interpolate_gap(
+                                    interpolated_data, 
+                                    start_idx - 1,  # Index vor der Lücke
+                                    end_idx,        # Index nach der Lücke
+                                    gap_size_mm
+                                )
+                                
+                                # ERSETZE die linear interpolierten Werte mit Kalman-Werten
+                                if len(kalman_interp) == num_points:
+                                    interpolated_data[start_idx:end_idx] = kalman_interp
+                                else:
+                                    # Wenn Anzahl nicht passt, resize
+                                    from scipy.interpolate import interp1d
+                                    x_old = np.linspace(0, 1, len(kalman_interp))
+                                    x_new = np.linspace(0, 1, num_points)
+                                    f = interp1d(x_old, kalman_interp, kind='linear')
+                                    interpolated_data[start_idx:end_idx] = f(x_new)
+                                
+                                interpolation_info.append({
+                                    'index': start_idx,
+                                    'size_mm': gap_size_mm,
+                                    'size_m': gap_size_mm / 1000,
+                                    'num_points': num_points,
+                                    'confidence': confidence,
+                                    'method': 'Kalman+SSA',
+                                    'start_idx': start_idx,
+                                    'end_idx': end_idx,
+                                    'removed_points': gap.get('removed_points', 0)
+                                })
+                                interpolation_ranges.append((start_idx, end_idx))
+                            
+                            # #region agent log
+                            _debug_log("streamlit_dashboard.py:AFTER_KALMAN_SSA", "Kalman+SSA interpolation (REPLACE)", {
+                                "filepath": filepath,
+                                "method": "Data Cleaner + Kalman+SSA",
+                                "cleaner_gaps_count": len(cleaner_gaps_info),
+                                "interpolation_info_count": len(interpolation_info),
+                                "output_length": len(interpolated_data)
+                            }, "E")
+                            # #endregion
+                        else:
+                            # Keine Fehler gefunden, verwende bereinigte Daten
+                            interpolated_data = cleaned_data
+                    
+                    elif interpolation_method == "Data Cleaner + Neural" and neural_interpolator:
+                        # Data Cleaner hat fehlerhafte Bereiche identifiziert
+                        # JETZT: Neural ERSETZT die lineare Interpolation mit KI-basierter Interpolation
+                        
+                        if cleaner_gaps_info:
+                            # Starte mit bereinigten Daten
+                            interpolated_data = np.array(cleaned_data)
+                            
+                            for gap in cleaner_gaps_info:
+                                start_idx = gap['start_idx']
+                                end_idx = gap['end_idx']
+                                start_value = gap['start_value']
+                                end_value = gap['end_value']
+                                gap_size_mm = abs(end_value - start_value)
+                                num_points = end_idx - start_idx
+                                
+                                # Verwende Neural-Interpolation für diesen Bereich
+                                # Neural interpolate() erwartet: data, gap_start, gap_end
+                                neural_interp, confidence = neural_interpolator.interpolate(
+                                    list(interpolated_data), 
+                                    start_idx - 1,  # Index vor der Lücke
+                                    end_idx         # Index nach der Lücke
+                                )
+                                
+                                # ERSETZE die linear interpolierten Werte mit Neural-Werten
+                                if len(neural_interp) == num_points:
+                                    interpolated_data[start_idx:end_idx] = neural_interp
+                                elif len(neural_interp) > 0:
+                                    # Wenn Anzahl nicht passt, resize
+                                    from scipy.interpolate import interp1d
+                                    x_old = np.linspace(0, 1, len(neural_interp))
+                                    x_new = np.linspace(0, 1, num_points)
+                                    f = interp1d(x_old, neural_interp, kind='linear')
+                                    interpolated_data[start_idx:end_idx] = f(x_new)
+                                
+                                interpolation_info.append({
+                                    'index': start_idx,
+                                    'size_mm': gap_size_mm,
+                                    'size_m': gap_size_mm / 1000,
+                                    'num_points': num_points,
+                                    'confidence': confidence,
+                                    'method': 'Neural Network',
+                                    'start_idx': start_idx,
+                                    'end_idx': end_idx,
+                                    'removed_points': gap.get('removed_points', 0)
+                                })
+                                interpolation_ranges.append((start_idx, end_idx))
+                            
+                            # #region agent log
+                            _debug_log("streamlit_dashboard.py:AFTER_NEURAL", "Neural interpolation (REPLACE)", {
+                                "filepath": filepath,
+                                "method": "Data Cleaner + Neural",
+                                "cleaner_gaps_count": len(cleaner_gaps_info),
+                                "interpolation_info_count": len(interpolation_info),
+                                "output_length": len(interpolated_data)
+                            }, "E")
+                            # #endregion
+                        else:
+                            # Keine Fehler gefunden, verwende bereinigte Daten
+                            interpolated_data = cleaned_data
                     
                 except Exception as e:
-                    st.warning(f"Datenbereinigung fehlgeschlagen: {e}")
+                    st.warning(f"Interpolation fehlgeschlagen ({interpolation_method}): {e}")
+                    import traceback
+                    st.error(traceback.format_exc())
                     interpolated_data = data
             
             # Status badge
@@ -622,14 +800,26 @@ def main():
             if show_interpolation and interpolation_info:
                 total_removed = sum(info.get('removed_points', 0) for info in interpolation_info)
                 num_regions = len(interpolation_info)
+                avg_confidence = np.mean([info.get('confidence', 0.8) for info in interpolation_info]) if interpolation_info else 0
                 
-                st.success(f"🧹 Daten bereinigt: {total_removed} Messfehler entfernt, {num_regions} Region(en) interpoliert")
+                method_icons = {
+                    "Data Cleaner (linear)": "🧹",
+                    "Data Cleaner + Kalman+SSA": "🏅",
+                    "Data Cleaner + Neural": "🧠"
+                }
+                icon = method_icons.get(interpolation_method, "✨")
+                
+                # Zeige Info über Bereinigung UND Interpolation
+                if "Kalman" in interpolation_method or "Neural" in interpolation_method:
+                    st.success(f"{icon} **{interpolation_method}**: {total_removed} Fehler bereinigt, {num_regions} Region(en) interpoliert (Ø Konfidenz: {avg_confidence:.0%})")
+                else:
+                    st.success(f"{icon} **{interpolation_method}**: {total_removed} Messfehler entfernt, {num_regions} Region(en) interpoliert")
             elif num_gaps > 0:
                 st.warning(f"⚠️ {num_gaps} Datenlücke(n) / Messfehler detektiert")
             else:
                 st.success("✅ Keine Datenlücken oder Messfehler")
             
-            cleaning_status = "Bereinigt" if show_interpolation else "Original"
+            cleaning_status = interpolation_method if show_interpolation else "Original"
             st.caption(f"Sampling Rate: {analyzer.sampling_rate} Hz | Absprung: {takeoff_point/1000:.2f}m | {cleaning_status}: {len(data)} Punkte")
             
             # Plot
@@ -674,18 +864,25 @@ def main():
             
             # Cleaning/Gaps details table
             if interpolation_info and show_interpolation:
-                st.markdown("### 🧹 Bereinigungsdetails")
+                method_icons = {
+                    "Data Cleaner (linear)": "🧹", 
+                    "Data Cleaner + Kalman+SSA": "🏅", 
+                    "Data Cleaner + Neural": "🧠"
+                }
+                icon = method_icons.get(interpolation_method, "✨")
+                st.markdown(f"### {icon} Interpolationsdetails ({interpolation_method})")
                 cleaning_data = []
                 for info in interpolation_info:
                     row = {
-                        'Start (m)': f"{info.get('start_value', info['index'])/1000:.2f}" if 'start_value' in info else f"Index {info['start_idx']}",
-                        'Ende (m)': f"{info.get('end_value', 0)/1000:.2f}" if 'end_value' in info else f"Index {info['end_idx']}",
-                        'Größe (m)': f"{info['size_m']:.2f}",
-                        'Entfernt': f"{info.get('removed_points', 0)} Punkte",
-                        'Interpoliert': f"{info['num_points']} Punkte",
-                        'Confidence': f"{info['confidence']:.0%}",
-                        'Methode': info['method']
+                        'Start': f"Index {info.get('start_idx', info.get('index', 0))}",
+                        'Ende': f"Index {info.get('end_idx', 0)}",
+                        'Größe (m)': f"{info.get('size_m', 0):.2f}",
+                        'Punkte eingefügt': f"{info.get('num_points', 0)}",
+                        'Konfidenz': f"{info.get('confidence', 0.8):.0%}",
+                        'Methode': info.get('method', interpolation_method)
                     }
+                    # Zeige entfernte Punkte für alle Methoden
+                    row['Fehler entfernt'] = f"{info.get('removed_points', 0)}"
                     cleaning_data.append(row)
                 
                 st.dataframe(pd.DataFrame(cleaning_data), use_container_width=True, hide_index=True)
