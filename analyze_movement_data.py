@@ -4,26 +4,6 @@ import matplotlib.pyplot as plt
 from typing import List, Tuple, Dict, Any
 from pyts.decomposition import SingularSpectrumAnalysis  # SSA für Interpolation
 import csv
-import json
-from pathlib import Path
-
-# #region agent log
-DEBUG_LOG_PATH = Path('/Users/andreparduhn/Documents/OSP_New/.cursor/debug.log')
-def _debug_log(location: str, message: str, data: dict, hypothesis_id: str = ""):
-    try:
-        log_entry = {
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": __import__('time').time() * 1000,
-            "sessionId": "debug-session",
-            "hypothesisId": hypothesis_id
-        }
-        with open(DEBUG_LOG_PATH, 'a') as f:
-            f.write(json.dumps(log_entry) + '\n')
-    except:
-        pass
-# #endregion
 
 class MovementDataAnalyzer:
     def __init__(self, folders: List[str]):
@@ -247,19 +227,6 @@ class MovementDataAnalyzer:
 
         # Determine sampling rate
         self.sampling_rate = self.determine_sampling_rate(movement_data, takeoff_point)
-
-        # #region agent log
-        _debug_log("analyze_movement_data.py:read_data_file:EXIT", "File parsed successfully", {
-            "filepath": filepath,
-            "athlete_name": athlete_name,
-            "attempt_num": attempt_num,
-            "takeoff_point": takeoff_point,
-            "sampling_rate": self.sampling_rate,
-            "data_points": len(movement_data),
-            "data_min": min(movement_data) if movement_data else 0,
-            "data_max": max(movement_data) if movement_data else 0
-        }, "D")
-        # #endregion
 
         return takeoff_point, movement_data, athlete_name, attempt_num
 
@@ -682,20 +649,6 @@ class MovementDataAnalyzer:
                     gaps_6_1.append(gap_info)
                 gaps.append(gap_info)
         
-        # #region agent log
-        _debug_log("analyze_movement_data.py:analyze_gaps_until_takeoff:EXIT", "Gap analysis complete", {
-            "filepath": filepath,
-            "takeoff_point": takeoff_point,
-            "takeoff_idx": takeoff_idx,
-            "zone_11_6_range": [zone_11_6_lower, zone_11_6_upper],
-            "zone_6_1_range": [zone_6_1_lower, zone_6_1_upper],
-            "total_gaps": len(gaps),
-            "gaps_11_6_count": len(gaps_11_6),
-            "gaps_6_1_count": len(gaps_6_1),
-            "gap_details": [{"idx": g['index'], "diff": g['difference'], "zone_6_1": g['zone_6_1'], "zone_11_6": g['zone_11_6']} for g in gaps[:3]]
-        }, "C")
-        # #endregion
-
         return {
             'file': os.path.basename(filepath),
             'athlete': athlete_name,

@@ -413,7 +413,7 @@ class NeuralInterpolator:
     
     def interpolate(self, data: List[float], gap_start: int, gap_end: int) -> Tuple[np.ndarray, float]:
         """
-        Interpoliere eine Lücke mit dem trainierten NN
+        Interpoliere eine Lücke mit dem trainierten NN - MIT CONSTRAINTS!
         
         Args:
             data: Originale Distanz-Daten
@@ -430,6 +430,10 @@ class NeuralInterpolator:
         
         data_array = np.array(data, dtype=np.float32)
         gap_length = gap_end - gap_start - 1
+        
+        # CONSTRAINTS: Get start and end values for the gap
+        start_value = data_array[gap_start] if gap_start < len(data_array) else data_array[-1]
+        end_value = data_array[min(gap_end, len(data_array) - 1)]
         
         # Kontext um Lücke herum (symmetrisch)
         context_size = max(self.seq_length // 2, gap_length + 20)
@@ -487,18 +491,63 @@ class NeuralInterpolator:
         # Extrahiere nur die Lücke
         local_gap_start = max(0, local_gap_start)
         local_gap_end = min(len(output_denorm), local_gap_end)
-        interpolated = output_denorm[local_gap_start:local_gap_end]
+        nn_interpolated = output_denorm[local_gap_start:local_gap_end]
         
+        # ========== CONSTRAINT POST-PROCESSING ==========
+        # Step 1: Create linear baseline between start and end
+        num_points = len(nn_interpolated)
+        if num_points == 0:
+            # Fallback: Linear interpolation
+            num_points = gap_length
+            interpolated = np.linspace(start_value, end_value, num_points + 2)[1:-1]
+            confidence = 0.6
+            return interpolated, confidence
+        
+        linear_baseline = np.linspace(start_value, end_value, num_points + 2)[1:-1]
+        
+        # Step 2: Compute NN deviation from baseline (should capture movement patterns)
+        nn_trend = nn_interpolated - nn_interpolated.mean()  # Remove mean to get pattern only
+        pattern_amplitude = np.std(nn_trend) * 0.5  # Scale down the pattern
+        
+        # Step 3: Add scaled NN pattern to linear baseline
+        # This keeps the NN's learned patterns but anchors to correct start/end
+        if pattern_amplitude > 0:
+            scaled_pattern = (nn_trend / (np.std(nn_trend) + 1e-8)) * pattern_amplitude
+            interpolated = linear_baseline + scaled_pattern
+        else:
+            interpolated = linear_baseline
+        
+        # Step 4: HARD CONSTRAINTS - must be between start and end
+        min_allowed = min(start_value, end_value)
+        max_allowed = max(start_value, end_value)
+        interpolated = np.clip(interpolated, min_allowed, max_allowed)
+        
+        # Step 5: Ensure monotonically increasing (athlete runs forward!)
+        for i in range(1, len(interpolated)):
+            if interpolated[i] < interpolated[i-1]:
+                # Lerp towards end value instead of plateau
+                progress = i / len(interpolated)
+                interpolated[i] = interpolated[i-1] + (end_value - interpolated[i-1]) * 0.1
+        
+        # Step 6: Final clip to ensure bounds
+        interpolated = np.clip(interpolated, min_allowed, max_allowed)
+        
+        # ========== CONFIDENCE CALCULATION ==========
         # Berechne Confidence basierend auf Attention
         attention_np = attention.cpu().numpy()[0].flatten()
-        gap_attention = attention_np[local_gap_start:local_gap_end].mean()
+        gap_attention = attention_np[local_gap_start:local_gap_end].mean() if local_gap_end > local_gap_start else 0.5
         context_attention = np.concatenate([
             attention_np[:local_gap_start],
             attention_np[local_gap_end:]
         ]).mean() if len(attention_np) > local_gap_end else 0.5
         
-        # Confidence: Wie viel Attention auf Kontext vs. Lücke
-        confidence = min(0.95, max(0.5, context_attention / (gap_attention + 0.1)))
+        # Confidence: Basierend auf Attention und wie gut NN-Vorhersage zu Constraints passt
+        base_confidence = min(0.95, max(0.5, context_attention / (gap_attention + 0.1)))
+        
+        # Reduce confidence if NN prediction was far from constraints
+        nn_deviation = np.mean(np.abs(nn_interpolated - linear_baseline))
+        deviation_penalty = min(0.3, nn_deviation / (scale + 1e-8))
+        confidence = max(0.5, base_confidence - deviation_penalty)
         
         return interpolated, confidence
     

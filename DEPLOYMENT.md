@@ -119,40 +119,53 @@ Die App öffnet sich automatisch im Browser unter `http://localhost:8501`
 
 ---
 
+## Neue Features
+
+### ✅ Datei-Upload für Kunden
+- Kunden können ihre eigenen `.dat` Dateien hochladen
+- Analyse mit allen trainierten Modellen (Kalman, SSA, Neural Network)
+- Gleiche Qualitätsmetriken wie bei lokalen Dateien
+
+### ✅ Passwortschutz
+- Integrierter Passwortschutz (Standard: `OSP2024`)
+- Konfigurierbar über Streamlit Secrets oder Umgebungsvariablen
+
+### ✅ Beispiel-Dateien
+- Alle Beispiel-Dateien (Yamal, Osazee, etc.) sind als Demo verfügbar
+- Kunden können zwischen Beispielen und eigenen Uploads wechseln
+
 ## Datenschutz & Sicherheit
 
 **Wichtig für sensible Daten:**
 - Streamlit Cloud Public Apps sind **öffentlich zugänglich**
-- Wenn die Daten vertraulich sind, nutze:
+- **Passwortschutz ist bereits implementiert!** (Standard: `OSP2024`)
+- Wenn die Daten sehr vertraulich sind, nutze:
   - **Private Repository** (kostet bei Streamlit Cloud)
-  - **Passwortschutz** in der App implementieren
+  - **Eigenes Passwort** setzen (siehe oben)
   - **Eigenen Server** (z.B. Render.com mit Authentication)
 
-**Einfacher Passwortschutz in Streamlit:**
-```python
-import streamlit as st
+**Passwortschutz ist bereits implementiert!**
 
-def check_password():
-    def password_entered():
-        if st.session_state["password"] == "DEIN_PASSWORT":
-            st.session_state["password_correct"] = True
-            del st.session_state["password"]
-        else:
-            st.session_state["password_correct"] = False
+Das Dashboard hat bereits einen integrierten Passwortschutz. Standard-Passwort: `OSP2024`
 
-    if "password_correct" not in st.session_state:
-        st.text_input("Passwort", type="password", on_change=password_entered, key="password")
-        return False
-    elif not st.session_state["password_correct"]:
-        st.text_input("Passwort", type="password", on_change=password_entered, key="password")
-        st.error("😕 Falsches Passwort")
-        return False
-    else:
-        return True
+**Passwort ändern:**
 
-if check_password():
-    # Hier kommt deine normale App
-    main()
+**Option 1: Streamlit Secrets (Empfohlen für Streamlit Cloud)**
+1. In Streamlit Cloud: "Manage app" → "Secrets"
+2. Füge hinzu:
+```toml
+OSP_DASHBOARD_PASSWORD = "DEIN_PASSWORT"
+```
+
+**Option 2: Umgebungsvariable (für lokale/Server-Deployments)**
+```bash
+export OSP_DASHBOARD_PASSWORD="DEIN_PASSWORT"
+```
+
+**Option 3: Lokale secrets.toml (für lokales Testen)**
+Erstelle `.streamlit/secrets.toml`:
+```toml
+OSP_DASHBOARD_PASSWORD = "DEIN_PASSWORT"
 ```
 
 ---

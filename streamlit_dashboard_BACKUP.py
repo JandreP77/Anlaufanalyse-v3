@@ -9,9 +9,6 @@ from analyze_movement_data import MovementDataAnalyzer
 from kalman_ssa_interpolator import KalmanSSAInterpolator
 from neural_interpolator import NeuralInterpolator
 from data_cleaner import DataCleaner
-import tempfile
-import io
-from typing import Tuple, List, Dict
 
 # Page config - MUST be first Streamlit command
 st.set_page_config(
@@ -549,133 +546,12 @@ def create_plot(analyzer, data, takeoff_point, athlete_name, attempt_num, interp
     
     return fig
 
-def check_password():
-    """Passwortschutz für die Anwendung"""
-    def password_entered():
-        # Passwort aus Streamlit Secrets, Umgebungsvariable oder Standardwert
-        try:
-            # Versuche Streamlit Secrets zu verwenden
-            correct_password = st.secrets.get("OSP_DASHBOARD_PASSWORD", "OSP2024")
-        except:
-            # Fallback: Umgebungsvariable oder Standardwert
-            correct_password = os.environ.get("OSP_DASHBOARD_PASSWORD", "OSP2024")
-        
-        if st.session_state["password"] == correct_password:
-            st.session_state["password_correct"] = True
-            del st.session_state["password"]
-        else:
-            st.session_state["password_correct"] = False
-
-    if "password_correct" not in st.session_state:
-        st.title("OSP Anlaufanalyse Dashboard")
-        st.markdown("---")
-        st.subheader("🔐 Zugriff geschützt")
-        st.text_input("Passwort eingeben", type="password", on_change=password_entered, key="password")
-        st.info("💡 Kontaktieren Sie den Administrator für Zugangsdaten.")
-        return False
-    elif not st.session_state["password_correct"]:
-        st.title("OSP Anlaufanalyse Dashboard")
-        st.markdown("---")
-        st.subheader("🔐 Zugriff geschützt")
-        st.text_input("Passwort eingeben", type="password", on_change=password_entered, key="password")
-        st.error("❌ Falsches Passwort. Bitte versuchen Sie es erneut.")
-        return False
-    else:
-        return True
-
-def read_uploaded_file(uploaded_file) -> Tuple[float, List[float], str, int]:
-    """
-    Liest eine hochgeladene .dat Datei und gibt die gleichen Daten zurück wie read_data_file
-    
-    Args:
-        uploaded_file: Streamlit UploadedFile Objekt
-        
-    Returns:
-        Tuple: (takeoff_point, data, athlete_name, attempt_num)
-    """
-    # Dateiinhalt lesen
-    content = uploaded_file.read()
-    
-    # Versuche verschiedene Encodings
-    for encoding in ['latin1', 'utf-8']:
-        try:
-            lines = content.decode(encoding).splitlines()
-            break
-        except UnicodeDecodeError:
-            continue
-    
-    # Gleiche Logik wie in MovementDataAnalyzer.read_data_file
-    athlete_name = lines[1].strip() if len(lines) > 1 else "Unbekannt"
-    attempt_num = int(lines[2].strip()) if len(lines) > 2 and lines[2].strip().isdigit() else 0
-    
-    # Takeoff-Punkt konvertieren
-    takeoff_str = lines[3].strip().replace(',', '.') if len(lines) > 3 else "0"
-    if '.' in takeoff_str:
-        takeoff_str = takeoff_str.replace('.', '')
-        takeoff_point = float(takeoff_str)
-    else:
-        takeoff_point = float(takeoff_str) if takeoff_str else 0.0
-    
-    # Daten ab Zeile 4 lesen
-    data = []
-    for line in lines[4:]:
-        line = line.strip()
-        if line:
-            try:
-                value = float(line.replace(',', '.'))
-                data.append(value)
-            except ValueError:
-                continue
-    
-    return takeoff_point, data, athlete_name, attempt_num
-
-def analyze_uploaded_file(analyzer, uploaded_file) -> Dict:
-    """
-    Analysiert eine hochgeladene Datei und gibt Gap-Analyse zurück
-    
-    Args:
-        analyzer: MovementDataAnalyzer Instanz
-        uploaded_file: Streamlit UploadedFile Objekt
-        
-    Returns:
-        Dict: Gap-Analyse ähnlich wie analyze_gaps_until_takeoff
-    """
-    # Temporäre Datei erstellen
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.dat', delete=False, encoding='latin1') as tmp_file:
-        content = uploaded_file.read()
-        # Zurückspulen für später
-        uploaded_file.seek(0)
-        
-        # Versuche verschiedene Encodings
-        for encoding in ['latin1', 'utf-8']:
-            try:
-                decoded_content = content.decode(encoding)
-                tmp_file.write(decoded_content)
-                tmp_file_path = tmp_file.name
-                break
-            except UnicodeDecodeError:
-                continue
-        
-        tmp_file_path = tmp_file.name
-    
-    try:
-        # Verwende die normale analyze_gaps_until_takeoff Funktion
-        gap_analysis = analyzer.analyze_gaps_until_takeoff(tmp_file_path)
-        return gap_analysis
-    finally:
-        # Temporäre Datei löschen
-        if os.path.exists(tmp_file_path):
-            os.unlink(tmp_file_path)
-
 def main():
-    # Passwortschutz prüfen
-    if not check_password():
-        return
-    
     # Header
     col1, col2 = st.columns([1, 4])
     with col1:
         # Try to load local logo, fallback to online version
+        import os
         logo_path = "osp_logo.png"
         if os.path.exists(logo_path):
             st.image(logo_path, width=200)
@@ -696,151 +572,74 @@ def main():
     except Exception as e:
         st.error(f"Fehler beim Laden der Daten: {e}")
         st.info("Stelle sicher, dass die 'Input files' Ordner vorhanden sind.")
-        df = pd.DataFrame()  # Leeres DataFrame falls Fehler
-    
-    # Datei-Upload-Option
-    st.subheader("📤 Eigene Datei hochladen")
-    uploaded_file = st.file_uploader(
-        "Wählen Sie eine .dat Datei zum Analysieren",
-        type=['dat'],
-        help="Laden Sie eine .dat Datei hoch, um sie mit unseren Modellen zu analysieren."
-    )
-    
-    # Modus: Upload oder lokale Dateien
-    use_uploaded = uploaded_file is not None
-    
-    # Variablen initialisieren (werden später gesetzt)
-    takeoff_point = None
-    data = None
-    athlete_name = None
-    attempt_num = None
-    gap_analysis = None
-    selected_file = None
+        return
     
     # 2-Column Layout
     col_left, col_right = st.columns([1, 2])
     
     with col_left:
-        if use_uploaded:
-            st.subheader("📤 Hochgeladene Datei")
-            st.info(f"📄 Datei: {uploaded_file.name}")
-            
-            # Datei analysieren
-            try:
-                takeoff_point, data, athlete_name, attempt_num = read_uploaded_file(uploaded_file)
-                uploaded_file.seek(0)  # Zurückspulen für später
-                gap_analysis = analyze_uploaded_file(analyzer, uploaded_file)
-                
-                # Erstelle ein "fake" selected_file Dict für Kompatibilität
-                num_gaps = gap_analysis['number_of_gaps']
-                num_gaps_6_1 = len(gap_analysis['gaps_6_1'])
-                num_gaps_11_6 = len(gap_analysis['gaps_11_6'])
-                
-                if num_gaps_6_1 > 0:
-                    status = 'rot'
-                    quality = 'Kritisch'
-                elif num_gaps_11_6 > 0:
-                    status = 'gelb'
-                    quality = 'Achtung'
-                elif num_gaps > 0:
-                    status = 'grün'
-                    quality = 'OK'
-                else:
-                    status = 'grün'
-                    quality = 'Sehr gut'
-                
-                selected_file = {
-                    'filepath': None,  # Wird nicht verwendet bei Upload
-                    'filename': uploaded_file.name,
-                    'folder': 'Hochgeladen',
-                    'Athlet': athlete_name,
-                    'Versuch': attempt_num,
-                    'Lücken': num_gaps,
-                    'Qualität': quality,
-                    'status': status,
-                    'takeoff_point': takeoff_point
-                }
-                
-                st.success(f"✅ {athlete_name} - Versuch {attempt_num}")
-                st.caption(f"Qualität: {quality}")
-                
-            except Exception as e:
-                st.error(f"Fehler beim Lesen der Datei: {e}")
-                st.exception(e)
-                return
-        else:
-            st.subheader("📋 Versuche")
+        st.subheader("📋 Versuche")
         
-            # Wenn keine Datei hochgeladen, zeige lokale Dateien
-            if not use_uploaded and len(df) > 0:
-                # Filters
-                with st.expander("🔍 Filter", expanded=False):
-                    quality_filter = st.multiselect(
-                        "Qualität",
-                        options=df['Qualität'].unique(),
-                        default=df['Qualität'].unique()
-                    )
-                    
-                    folder_filter = st.multiselect(
-                        "Disziplin",
-                        options=df['folder'].unique(),
-                        default=df['folder'].unique()
-                    )
-                
-                # Apply filters
-                filtered_df = df[
-                    (df['Qualität'].isin(quality_filter)) &
-                    (df['folder'].isin(folder_filter))
-                ]
-                
-                # Display table with selection
-                display_df = filtered_df[['Athlet', 'Versuch', 'Lücken', 'Qualität']].copy()
-                display_df.insert(0, 'Index', range(len(display_df)))
-                
-                # Color code quality
-                def color_quality(row):
-                    if row['Qualität'] == 'Kritisch':
-                        return ['background-color: #f8d7da'] * len(row)
-                    elif row['Qualität'] == 'Achtung':
-                        return ['background-color: #fff3cd'] * len(row)
-                    elif row['Qualität'] == 'Sehr gut':
-                        return ['background-color: #d4edda'] * len(row)
-                    else:
-                        return [''] * len(row)
-                
-                styled_df = display_df.style.apply(color_quality, axis=1)
-                
-                # Show interactive dataframe with selection
-                event = st.dataframe(
-                    styled_df,
-                    use_container_width=True,
-                    height=500,
-                    hide_index=True,
-                    on_select="rerun",
-                    selection_mode="single-row"
-                )
-                
-                # Get selected row from dataframe interaction
-                if event.selection and event.selection.rows:
-                    selected_row_idx = event.selection.rows[0]
-                    selected_file = filtered_df.iloc[selected_row_idx]
-                else:
-                    # Default to first row if nothing selected
-                    if len(filtered_df) == 0:
-                        st.warning("Keine Versuche gefunden. Bitte Filter anpassen.")
-                        return
-                    selected_file = filtered_df.iloc[0]
-                
-                st.markdown("---")
-                st.caption(f"📌 Ausgewählt: {selected_file['Athlet']} - Versuch {selected_file['Versuch']}")
-            elif not use_uploaded and len(df) == 0:
-                st.info("📤 Laden Sie eine Datei hoch oder stellen Sie sicher, dass lokale Dateien vorhanden sind.")
-                return
+        # Filters
+        with st.expander("🔍 Filter", expanded=False):
+            quality_filter = st.multiselect(
+                "Qualität",
+                options=df['Qualität'].unique(),
+                default=df['Qualität'].unique()
+            )
             
-            # Wenn lokale Datei ausgewählt, aber noch nicht geladen
-            if not use_uploaded and selected_file is not None and data is None:
-                # Wird später im col_right Block geladen
-                pass
+            folder_filter = st.multiselect(
+                "Disziplin",
+                options=df['folder'].unique(),
+                default=df['folder'].unique()
+            )
+        
+        # Apply filters
+        filtered_df = df[
+            (df['Qualität'].isin(quality_filter)) &
+            (df['folder'].isin(folder_filter))
+        ]
+        
+        # Display table with selection
+        display_df = filtered_df[['Athlet', 'Versuch', 'Lücken', 'Qualität']].copy()
+        display_df.insert(0, 'Index', range(len(display_df)))
+        
+        # Color code quality
+        def color_quality(row):
+            if row['Qualität'] == 'Kritisch':
+                return ['background-color: #f8d7da'] * len(row)
+            elif row['Qualität'] == 'Achtung':
+                return ['background-color: #fff3cd'] * len(row)
+            elif row['Qualität'] == 'Sehr gut':
+                return ['background-color: #d4edda'] * len(row)
+            else:
+                return [''] * len(row)
+        
+        styled_df = display_df.style.apply(color_quality, axis=1)
+        
+        # Show interactive dataframe with selection
+        event = st.dataframe(
+            styled_df,
+            use_container_width=True,
+            height=500,
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row"
+        )
+        
+        # Get selected row from dataframe interaction
+        if event.selection and event.selection.rows:
+            selected_row_idx = event.selection.rows[0]
+            selected_file = filtered_df.iloc[selected_row_idx]
+        else:
+            # Default to first row if nothing selected
+            if len(filtered_df) == 0:
+                st.warning("Keine Versuche gefunden. Bitte Filter anpassen.")
+                return
+            selected_file = filtered_df.iloc[0]
+        
+        st.markdown("---")
+        st.caption(f"📌 Ausgewählt: {selected_file['Athlet']} - Versuch {selected_file['Versuch']}")
     
     with col_right:
         # Header with interpolation method selection
@@ -865,17 +664,11 @@ def main():
             show_interpolation = interpolation_method != "Keine"
         
         try:
-            # Load selected file (lokal oder hochgeladen)
-            if use_uploaded:
-                # Daten wurden bereits oben geladen
-                # uploaded_file, takeoff_point, data, athlete_name, attempt_num, gap_analysis sind bereits verfügbar
-                gaps = gap_analysis['gaps']
-            else:
-                # Lokale Datei laden
-                filepath = selected_file['filepath']
-                takeoff_point, data, athlete_name, attempt_num = analyzer.read_data_file(filepath)
-                gap_analysis = analyzer.analyze_gaps_until_takeoff(filepath)
-                gaps = gap_analysis['gaps']
+            # Load selected file
+            filepath = selected_file['filepath']
+            takeoff_point, data, athlete_name, attempt_num = analyzer.read_data_file(filepath)
+            gap_analysis = analyzer.analyze_gaps_until_takeoff(filepath)
+            gaps = gap_analysis['gaps']
             
             # Data Cleaning + Interpolation (removes measurement errors, then interpolates)
             interpolated_data = data
