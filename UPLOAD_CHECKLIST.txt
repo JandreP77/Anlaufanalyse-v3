@@ -1,0 +1,29 @@
+=== DATEIEN FÜR GITHUB UPLOAD ===
+
+WICHTIGE PYTHON-MODULE:
+- streamlit_dashboard.py
+- analyze_movement_data.py
+- kalman_ssa_interpolator.py
+- neural_interpolator.py
+- data_cleaner.py
+
+MODELLE (KRITISCH!):
+- neural_interpolator_model.pt
+- global_ssa_models.pkl
+- hybrid_ssa_models.pkl
+
+KONFIGURATION:
+- requirements.txt
+- .gitignore
+
+ASSETS:
+- osp_logo.png
+
+BEISPIEL-DATEIEN (Optional):
+- Input files/ (gesamter Ordner)
+
+NICHT HOCHLADEN:
+- *_BACKUP.py
+- venv/
+- __pycache__/
+- .streamlit/secrets.toml
