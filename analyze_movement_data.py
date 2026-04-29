@@ -2,7 +2,6 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import List, Tuple, Dict, Any
-from pyts.decomposition import SingularSpectrumAnalysis  # SSA für Interpolation
 import csv
 
 class MovementDataAnalyzer:
@@ -252,63 +251,17 @@ class MovementDataAnalyzer:
         return gaps
 
     def ssa_interpolate_gap(self, data: List[float], gap_start: int, gap_end: int, window_size: int = 20) -> List[float]:
-        """
-        Interpoliert eine Lücke im Zeitverlauf mit SSA und gibt die rekonstruierten Werte für die Lücke zurück.
-        Args:
-            data (List[float]): Zeitreihe
-            gap_start (int): Index vor der Lücke
-            gap_end (int): Index nach der Lücke
-            window_size (int): SSA-Fenstergröße
-        Returns:
-            List[float]: Interpolierte Werte für die Lücke
-        """
-        # Nur den Bereich um die Lücke für SSA nehmen
-        left = max(0, gap_start - window_size)
-        right = min(len(data), gap_end + window_size)
-        segment = np.array(data[left:right])
-        # Lücke maskieren
-        mask = np.ones_like(segment, dtype=bool)
-        mask[gap_start-left+1:gap_end-left] = False
-        segment_masked = segment.copy()
-        segment_masked[~mask] = np.nan
-        # SSA auf den maskierten Bereich anwenden
-        ssa = SingularSpectrumAnalysis(window_size=window_size)
-        # SSA kann keine NaNs, daher einfache lineare Interpolation als Fallback für NaNs
-        segment_filled = segment_masked.copy()
-        nans = np.isnan(segment_filled)
-        if np.any(nans):
-            segment_filled[nans] = np.interp(np.flatnonzero(nans), np.flatnonzero(~nans), segment_filled[~nans])
-        # SSA-Rekonstruktion
-        segment_ssa = ssa.fit_transform(segment_filled.reshape(1, -1))[0]
-        # Nur die Lücke extrahieren
-        interpolated = segment_ssa[gap_start-left+1:gap_end-left]
-        return interpolated.tolist()
+        """Lineare Interpolation als Fallback (pyts/SSA nicht mehr verwendet)."""
+        num_points = gap_end - gap_start - 1
+        if num_points <= 0:
+            return []
+        start_val = data[gap_start]
+        end_val = data[gap_end] if gap_end < len(data) else data[-1]
+        return np.linspace(start_val, end_val, num_points + 2)[1:-1].tolist()
 
     def fill_gaps_with_ssa(self, data: List[float], gaps: List[Dict[str, Any]], window_size: int = 20) -> Tuple[List[float], List[Tuple[int, int]]]:
-        """
-        Füllt alle Lücken im Datensatz mit SSA-Interpolation und gibt die neue Zeitreihe sowie die Lückenbereiche zurück.
-        Args:
-            data (List[float]): Zeitreihe
-            gaps (List[dict]): Liste der Lücken (mit 'index')
-            window_size (int): SSA-Fenstergröße
-        Returns:
-            Tuple[List[float], List[Tuple[int, int]]]: Neue Zeitreihe, Liste der Lückenbereiche (start, end)
-        """
-        data_filled = data.copy()
-        gap_ranges = []
-        for gap in gaps:
-            idx = gap['index']
-            # Lücke ist zwischen idx und idx+1
-            gap_start = idx
-            gap_end = idx+1
-            # Suche, ob mehrere aufeinanderfolgende Lücken existieren
-            while gap_end < len(data)-1 and any(g['index'] == gap_end for g in gaps):
-                gap_end += 1
-            # Interpolieren
-            interpolated = self.ssa_interpolate_gap(data_filled, gap_start, gap_end, window_size)
-            data_filled[gap_start+1:gap_end] = interpolated
-            gap_ranges.append((gap_start+1, gap_end))
-        return data_filled, gap_ranges
+        """Nicht mehr verwendet — Interpolation erfolgt über KalmanSSAInterpolator."""
+        return list(data), []
 
     def plot_movement_profile(self, data: List[float], takeoff_point: float, 
                             athlete_name: str, attempt_num: int, 

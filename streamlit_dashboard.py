@@ -2,18 +2,17 @@ import streamlit as st
 import os
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from scipy.interpolate import interp1d
 from analyze_movement_data import MovementDataAnalyzer
 from kalman_ssa_interpolator import KalmanSSAInterpolator
-from neural_interpolator import NeuralInterpolator
 from data_cleaner import DataCleaner
 import tempfile
 import io
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Optional
 
-# Page config - MUST be first Streamlit command
+# --- Page config (must be first Streamlit call) ---
 st.set_page_config(
     page_title="OSP Anlaufanalyse",
     page_icon="🏃",
@@ -21,1267 +20,757 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# OSP Colors
-OSP_COLORS = {
-    'red': '#e30613',
-    'black': '#000000',
-    'white': '#ffffff',
-    'gold': '#ffd700',
-    'gray': '#f5f5f5',
-    'light_gray': '#e8e8e8',
-    'green': '#28a745',
-    'yellow': '#ffc107',
-}
+OSP_RED    = '#e30613'
+OSP_BLACK  = '#000000'
+OSP_WHITE  = '#ffffff'
+OSP_GOLD   = '#ffd700'
+OSP_GRAY   = '#f5f5f5'
+OSP_LGRAY  = '#e8e8e8'
+OSP_GREEN  = '#28a745'
+OSP_YELLOW = '#ffc107'
+OSP_PURPLE = '#a259d9'
 
-# Custom CSS
 st.markdown(f"""
 <style>
-    .main {{
-        padding: 0rem 1rem;
-    }}
-    .stApp {{
-        background-color: {OSP_COLORS['white']};
-    }}
-    h1 {{
-        color: {OSP_COLORS['red']};
-        font-weight: bold;
-    }}
-    h2, h3, h4 {{
-        color: {OSP_COLORS['black']};
-    }}
-    .metric-card {{
-        background-color: {OSP_COLORS['gray']};
-        padding: 15px;
-        border-radius: 8px;
-        margin: 10px 0;
-    }}
+    .main {{ padding: 0rem 1rem; }}
+    .stApp {{ background-color: {OSP_WHITE}; }}
+    h1 {{ color: {OSP_RED}; font-weight: bold; }}
+    h2, h3, h4 {{ color: {OSP_BLACK}; }}
     .status-badge {{
-        padding: 8px 20px;
-        border-radius: 20px;
-        font-weight: bold;
-        color: white;
-        display: inline-block;
-        margin: 10px 0;
+        padding: 8px 20px; border-radius: 20px; font-weight: bold;
+        color: white; display: inline-block; margin: 10px 0;
     }}
-    .status-green {{
-        background-color: {OSP_COLORS['green']};
-    }}
-    .status-yellow {{
-        background-color: {OSP_COLORS['yellow']};
-        color: black;
-    }}
-    .status-red {{
-        background-color: {OSP_COLORS['red']};
-    }}
+    .status-green  {{ background-color: {OSP_GREEN}; }}
+    .status-yellow {{ background-color: {OSP_YELLOW}; color: black; }}
+    .status-red    {{ background-color: {OSP_RED}; }}
 </style>
 """, unsafe_allow_html=True)
 
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def parse_dat(filepath: str) -> Tuple[float, List[float], str, int]:
+    """Liest eine .dat Laveg-Datei und gibt (takeoff_mm, data_mm, name, versuch) zurück."""
+    for enc in ['latin1', 'utf-8']:
+        try:
+            with open(filepath, 'r', encoding=enc) as f:
+                lines = f.readlines()
+            break
+        except UnicodeDecodeError:
+            continue
+
+    athlete = lines[1].strip() if len(lines) > 1 else "Unbekannt"
+    versuch = int(lines[2].strip()) if len(lines) > 2 and lines[2].strip().isdigit() else 0
+
+    takeoff_str = lines[3].strip().replace(',', '.') if len(lines) > 3 else "0"
+    if '.' in takeoff_str:
+        takeoff_mm = float(takeoff_str.replace('.', ''))
+    else:
+        takeoff_mm = float(takeoff_str) if takeoff_str else 0.0
+
+    data = []
+    for line in lines[8:]:
+        v = line.strip().replace(',', '.')
+        if v:
+            try:
+                data.append(float(v))
+            except ValueError:
+                pass
+
+    return takeoff_mm, data, athlete, versuch
+
+
+def parse_uploaded(uploaded_file) -> Tuple[float, List[float], str, int]:
+    """Wie parse_dat, aber aus einem Streamlit UploadedFile."""
+    content = uploaded_file.read()
+    for enc in ['latin1', 'utf-8']:
+        try:
+            text = content.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    lines = text.splitlines()
+
+    athlete = lines[1].strip() if len(lines) > 1 else "Unbekannt"
+    versuch = int(lines[2].strip()) if len(lines) > 2 and lines[2].strip().isdigit() else 0
+
+    takeoff_str = lines[3].strip().replace(',', '.') if len(lines) > 3 else "0"
+    if '.' in takeoff_str:
+        takeoff_mm = float(takeoff_str.replace('.', ''))
+    else:
+        takeoff_mm = float(takeoff_str) if takeoff_str else 0.0
+
+    data = []
+    for line in lines[8:]:
+        v = line.strip().replace(',', '.')
+        if v:
+            try:
+                data.append(float(v))
+            except ValueError:
+                pass
+
+    return takeoff_mm, data, athlete, versuch
+
+
+def classify_gaps(gaps_info: List[Dict], takeoff_mm: float) -> Tuple[str, str]:
+    """Gibt (status, qualität) basierend auf Zonen zurück."""
+    zone_6_1 = [g for g in gaps_info
+                if g['start_value'] >= takeoff_mm - 6000 and g['start_value'] < takeoff_mm - 1000]
+    zone_11_6 = [g for g in gaps_info
+                 if g['start_value'] >= takeoff_mm - 11000 and g['start_value'] < takeoff_mm - 6000]
+
+    if zone_6_1:
+        return 'rot', 'Kritisch'
+    if zone_11_6:
+        return 'gelb', 'Achtung'
+    if gaps_info:
+        return 'grün', 'OK'
+    return 'grün', 'Sehr gut'
+
+
+# ── Cached resources ──────────────────────────────────────────────────────────
+
 @st.cache_resource
 def load_analyzer():
-    """Load the analyzer with all folders"""
     folders = [
         "Input files/Drei M",
         "Input files/Drei W",
         "Input files/Weit M",
-        "Input files/Weit W"
+        "Input files/Weit W",
     ]
     return MovementDataAnalyzer(folders)
 
-@st.cache_resource
-def load_kalman_interpolator():
-    """Load the Kalman+SSA Interpolator (Olympic-grade) with global models"""
-    return KalmanSSAInterpolator(sampling_rate=50, ssa_window=40, use_global_models=True)
 
 @st.cache_resource
-def load_neural_interpolator():
-    """Load the Neural Network Interpolator"""
-    interpolator = NeuralInterpolator(model_path="neural_interpolator_model.pt")
-    if interpolator.is_trained:
-        return interpolator
-    else:
-        return None
+def load_interpolator():
+    return KalmanSSAInterpolator(sampling_rate=50, ssa_window=40)
+
 
 @st.cache_resource
-def load_data_cleaner():
-    """Load the Data Cleaner for removing measurement errors"""
-    return DataCleaner(max_backward_mm=500, min_forward_velocity=2.0)
+def load_cleaner():
+    return DataCleaner(max_backward_mm=500, min_forward_velocity=2.0, gap_threshold_mm=1000.0)
+
 
 @st.cache_data
-def load_file_list(_analyzer):
-    """Load and cache the file list"""
-    file_data = []
-    for folder in _analyzer.folders:
+def load_file_list(_cleaner):
+    """Lädt alle .dat-Dateien, erkennt Gaps mit DataCleaner, klassifiziert nach Zonen."""
+    folders = [
+        "Input files/Drei M",
+        "Input files/Drei W",
+        "Input files/Weit M",
+        "Input files/Weit W",
+    ]
+    rows = []
+    for folder in folders:
         if not os.path.exists(folder):
             continue
-        for fname in os.listdir(folder):
-            if fname.lower().endswith('.dat'):
-                fpath = os.path.join(folder, fname)
-                try:
-                    takeoff_point, data, athlete_name, attempt_num = _analyzer.read_data_file(fpath)
-                    gap_analysis = _analyzer.analyze_gaps_until_takeoff(fpath)
-                    
-                    num_gaps = gap_analysis['number_of_gaps']
-                    num_gaps_6_1 = len(gap_analysis['gaps_6_1'])
-                    num_gaps_11_6 = len(gap_analysis['gaps_11_6'])
-                    
-                    if num_gaps_6_1 > 0:
-                        status = 'rot'
-                        quality = 'Kritisch'
-                    elif num_gaps_11_6 > 0:
-                        status = 'gelb'
-                        quality = 'Achtung'
-                    elif num_gaps > 0:
-                        status = 'grün'
-                        quality = 'OK'
-                    else:
-                        status = 'grün'
-                        quality = 'Sehr gut'
-                    
-                    file_data.append({
-                        'filepath': fpath,
-                        'filename': fname,
-                        'folder': os.path.basename(folder),
-                        'Athlet': athlete_name,
-                        'Versuch': attempt_num,
-                        'Lücken': num_gaps,
-                        'Qualität': quality,
-                        'status': status,
-                        'takeoff_point': takeoff_point
-                    })
-                except Exception as e:
-                    continue
-    
-    return pd.DataFrame(file_data).sort_values(['folder', 'Athlet', 'Versuch'])
+        for fname in sorted(os.listdir(folder)):
+            if not fname.lower().endswith('.dat'):
+                continue
+            fpath = os.path.join(folder, fname)
+            try:
+                takeoff_mm, data, athlete, versuch = parse_dat(fpath)
+                _, gaps_info, _ = _cleaner.clean_and_interpolate(data, sampling_rate=50)
+                status, quality = classify_gaps(gaps_info, takeoff_mm)
+                rows.append({
+                    'filepath': fpath,
+                    'filename': fname,
+                    'folder': os.path.basename(folder),
+                    'Athlet': athlete,
+                    'Versuch': versuch,
+                    'Lücken': len(gaps_info),
+                    'Qualität': quality,
+                    'status': status,
+                    'takeoff_mm': takeoff_mm,
+                })
+            except Exception:
+                continue
+    return pd.DataFrame(rows)
 
-def calculate_quality_metrics(analyzer, data, takeoff_point, ssa_filled, ssa_ranges):
-    """Calculate quality metrics - NUR bis zum Absprungpunkt!"""
-    try:
-        # Finde den Index des Absprungpunkts (wo Position >= takeoff_point)
-        data_array = np.array(data)
-        takeoff_indices = np.where(data_array >= takeoff_point)[0]
-        if len(takeoff_indices) > 0:
-            takeoff_idx = takeoff_indices[0]
-        else:
-            takeoff_idx = len(data)
-        
-        # NUR Daten bis zum Absprung verwenden!
-        relevant_data = data_array[:takeoff_idx] if takeoff_idx > 0 else data_array
-        relevant_ssa = np.array(ssa_filled)[:takeoff_idx] if takeoff_idx > 0 else np.array(ssa_filled)
-        
-        # Interpolation quality (nur relevante Bereiche)
-        if ssa_ranges:
-            # Nur Ranges bis zum Absprung berücksichtigen
-            relevant_ranges = [(s, e) for s, e in ssa_ranges if s < takeoff_idx]
-            
-            if len(relevant_data) > 1:
-                original_velocities = np.diff(relevant_data)
-                interpolated_velocities = np.diff(relevant_ssa)
-                smoothness_score = max(0, 1 - np.mean(np.abs(np.diff(interpolated_velocities))) / 100)
-            else:
-                smoothness_score = 1.0
-            
-            continuity_scores = []
-            for start, end in relevant_ranges:
-                if end < len(relevant_data):
-                    continuity_scores.append(abs(relevant_ssa[end] - relevant_data[end]))
-            
-            if continuity_scores:
-                continuity_score = max(0, 1 - np.mean(continuity_scores) / np.max(relevant_data))
-            else:
-                continuity_score = 1.0
-            
-            interpolation_quality = (smoothness_score + continuity_score) / 2
-        else:
-            interpolation_quality = 1.0
-        
-        # Data quality - NUR bis Absprung
-        if len(relevant_data) > 1:
-            noise_level = np.std(np.diff(relevant_data))
-        else:
-            noise_level = 0
-        noise_score = max(0, 1 - min(noise_level / 1000, 1))
-        
-        gaps = analyzer.check_for_gaps(list(relevant_data), takeoff_point)
-        gap_score = max(0, 1 - min(len(gaps) / 5, 1))
-        
-        velocities = analyzer.calculate_velocity(list(relevant_data))
-        valid_velocities = [v for v in velocities if not np.isnan(v)]
-        if valid_velocities:
-            velocity_score = max(0, 1 - min(np.std(valid_velocities) / 5, 1))
-        else:
-            velocity_score = 0
-        
-        data_quality = (noise_score + gap_score + velocity_score) / 3
-        
-        # Technical stability - NUR bis Absprung
-        step_pattern = analyzer.analyze_step_pattern(list(relevant_data))
-        step_stability = max(0, 1 - min(step_pattern['std_step_size'] / 100, 1))
-        
-        if valid_velocities:
-            velocity_stability = max(0, 1 - min(np.std(valid_velocities) / 5, 1))
-        else:
-            velocity_stability = 0
-        
-        accelerations = np.diff(velocities)
-        valid_accelerations = [a for a in accelerations if not np.isnan(a)]
-        if valid_accelerations:
-            acceleration_stability = max(0, 1 - min(np.std(valid_accelerations) / 2, 1))
-        else:
-            acceleration_stability = 0
-        
-        technical_stability = (step_stability + velocity_stability + acceleration_stability) / 3
-        
-        return {
-            'interpolation_quality': interpolation_quality,
-            'data_quality': data_quality,
-            'technical_stability': technical_stability,
-            'noise_level': noise_level,
-            'gap_count': len(gaps)
-        }
-    except:
-        return {
-            'interpolation_quality': 0.5,
-            'data_quality': 0.5,
-            'technical_stability': 0.5,
-            'noise_level': 0,
-            'gap_count': 0
-        }
 
-def analyze_zone(analyzer, data, takeoff_point, zone_start, zone_end):
-    """Analyze a specific zone"""
-    try:
-        zone_start_idx = None
-        zone_end_idx = None
-        
-        for i, d in enumerate(data):
-            if d >= takeoff_point - zone_start and zone_start_idx is None:
-                zone_start_idx = i
-            if d >= takeoff_point - zone_end:
-                zone_end_idx = i
-                break
-        
-        if zone_start_idx is None or zone_end_idx is None or zone_start_idx >= zone_end_idx:
-            return None
-        
-        zone_data = data[zone_start_idx:zone_end_idx]
-        
-        if len(zone_data) < 2:
-            return None
-        
-        velocities = analyzer.calculate_velocity(zone_data)
-        valid_velocities = [v for v in velocities if not np.isnan(v)]
-        
-        if len(valid_velocities) < 2:
-            return None
-        
-        accelerations = np.diff(valid_velocities)
-        step_lengths = np.diff(zone_data)
-        
-        gaps = []
-        for gap in analyzer.check_for_gaps(data, takeoff_point):
-            if zone_start_idx <= gap[0] <= zone_end_idx:
-                gaps.append(gap)
-        
-        return {
-            'mean_velocity': np.mean(valid_velocities),
-            'velocity_std': np.std(valid_velocities),
-            'step_length_mean': np.mean(step_lengths),
-            'step_length_std': np.std(step_lengths),
-            'acceleration_mean': np.mean(accelerations) if len(accelerations) > 0 else 0,
-            'acceleration_std': np.std(accelerations) if len(accelerations) > 0 else 0,
-            'data_points': len(zone_data),
-            'gaps': len(gaps)
-        }
-    except:
-        return None
+# ── Interpolation pipeline ────────────────────────────────────────────────────
 
-def create_plot(analyzer, data, takeoff_point, athlete_name, attempt_num, interpolated_data, interpolation_ranges, gaps, show_interpolation=False):
-    """Create interactive plotly figure with cleaned data"""
+METHOD_OPTIONS = [
+    "Automatisch (Kalman+SSA)",
+    "PCHIP",
+    "Kalman Filter",
+    "SSA",
+    "Kalman+SSA Hybrid",
+    "Linear (Basis)",
+    "Keine",
+]
+
+METHOD_KEY = {
+    "Automatisch (Kalman+SSA)": "kalman_ssa",
+    "PCHIP":                    "pchip",
+    "Kalman Filter":            "kalman",
+    "SSA":                      "ssa",
+    "Kalman+SSA Hybrid":        "kalman_ssa",
+    "Linear (Basis)":           "linear",
+}
+
+METHOD_LABEL = {
+    "kalman_ssa": "Kalman+SSA Hybrid",
+    "pchip":      "PCHIP (Monoton)",
+    "kalman":     "Kalman Filter",
+    "ssa":        "SSA (Muster)",
+    "linear":     "Linear",
+}
+
+METHOD_CONF = {
+    "pchip":      0.95,
+    "kalman_ssa": 0.90,
+    "kalman":     0.90,
+    "ssa":        0.85,
+    "linear":     0.80,
+}
+
+
+def run_interpolation(
+    data: List[float],
+    sampling_rate: int,
+    method_name: str,
+    cleaner: DataCleaner,
+    interpolator: KalmanSSAInterpolator,
+) -> Tuple[np.ndarray, List[Dict], List[Tuple[int, int]]]:
+    """
+    Führt DataCleaner + Interpolation durch.
+    Gibt (interpolated_data, interpolation_info, ranges) zurück.
+    """
+    cleaned, gaps_info, _ = cleaner.clean_and_interpolate(data, sampling_rate=sampling_rate)
+    interpolated = np.array(cleaned, dtype=float)
+    interp_info = []
+    ranges = []
+
+    if method_name == "Keine" or not gaps_info:
+        if not gaps_info:
+            pass
+        else:
+            # Keine Methode — aber trotzdem gap-info für Anzeige
+            for g in gaps_info:
+                interp_info.append({
+                    'start_idx': g['start_idx'], 'end_idx': g['end_idx'],
+                    'size_mm': g['gap_size_mm'], 'size_m': g['gap_size_mm'] / 1000,
+                    'num_points': g['end_idx'] - g['start_idx'],
+                    'confidence': 0.0, 'method': 'Keine',
+                    'removed_points': g.get('removed_points', 0),
+                })
+                ranges.append((g['start_idx'], g['end_idx']))
+        return np.array(data, dtype=float), interp_info, ranges
+
+    interp_key = METHOD_KEY.get(method_name, "kalman_ssa")
+
+    for gap in gaps_info:
+        si, ei = gap['start_idx'], gap['end_idx']
+        gsm = abs(gap['end_value'] - gap['start_value'])
+        n_pts = ei - si
+        if n_pts <= 0:
+            continue
+
+        if interp_key == "linear":
+            result = np.linspace(gap['start_value'], gap['end_value'], n_pts + 2)[1:-1]
+            conf = METHOD_CONF["linear"]
+        else:
+            try:
+                result, conf = interpolator.interpolate_gap(
+                    interpolated,
+                    max(0, si - 1),
+                    min(ei, len(interpolated) - 1),
+                    gsm,
+                    method=interp_key,
+                    num_points_override=n_pts,
+                )
+            except Exception:
+                result = np.linspace(gap['start_value'], gap['end_value'], n_pts + 2)[1:-1]
+                conf = METHOD_CONF["linear"]
+
+        if len(result) == n_pts:
+            interpolated[si:ei] = result
+        elif len(result) > 1:
+            f = interp1d(np.linspace(0, 1, len(result)), result, kind='linear')
+            interpolated[si:ei] = f(np.linspace(0, 1, n_pts))
+
+        interp_info.append({
+            'start_idx': si, 'end_idx': ei,
+            'size_mm': gsm, 'size_m': gsm / 1000,
+            'num_points': n_pts, 'confidence': conf,
+            'method': METHOD_LABEL.get(interp_key, interp_key),
+            'removed_points': gap.get('removed_points', 0),
+        })
+        ranges.append((si, ei))
+
+    # Finale Monotonie-Erzwingung
+    for i in range(1, len(interpolated)):
+        if interpolated[i] < interpolated[i - 1]:
+            interpolated[i] = interpolated[i - 1]
+
+    return interpolated, interp_info, ranges
+
+
+# ── Plotting ──────────────────────────────────────────────────────────────────
+
+def create_plot(
+    analyzer: MovementDataAnalyzer,
+    data: List[float],
+    takeoff_mm: float,
+    athlete: str,
+    versuch: int,
+    interpolated: np.ndarray,
+    ranges: List[Tuple[int, int]],
+    show_interp: bool,
+) -> go.Figure:
+
     fig = make_subplots(
         rows=2, cols=1,
         subplot_titles=('Distanz-Profil', 'Geschwindigkeits-Profil'),
         vertical_spacing=0.12,
-        row_heights=[0.5, 0.5]
+        row_heights=[0.5, 0.5],
     )
-    
-    # Show original data as light gray dashed line (for comparison)
-    if show_interpolation:
+
+    # Original (grau, gestrichelt) nur wenn Interpolation aktiv
+    if show_interp:
         fig.add_trace(go.Scatter(
-            y=[d/1000 for d in data],
-            name='Original (mit Fehlern)', 
+            y=[d / 1000 for d in data],
+            name='Original (Rohdaten)',
             line=dict(color='lightgray', width=1, dash='dot'),
-            hovertemplate='Frame: %{x}<br>Original: %{y:.2f} m<extra></extra>',
-            opacity=0.5
+            opacity=0.5,
+            hovertemplate='Frame %{x}: %{y:.3f} m<extra></extra>',
         ), row=1, col=1)
-    
-    # Data to plot (cleaned if available)
-    plot_data = interpolated_data if show_interpolation else data
-    data_label = 'Bereinigt' if show_interpolation else 'Messdaten'
-    data_color = '#28a745' if show_interpolation else 'blue'
-    
+
+    plot_data = interpolated if show_interp else np.array(data)
     fig.add_trace(go.Scatter(
-        y=[d/1000 for d in plot_data],  # Convert to meters
-        name=data_label, 
-        line=dict(color=data_color, width=2),
-        hovertemplate='Frame: %{x}<br>Distanz: %{y:.2f} m<extra></extra>'
+        y=[d / 1000 for d in plot_data],
+        name='Bereinigt' if show_interp else 'Messdaten',
+        line=dict(color=OSP_GREEN if show_interp else 'royalblue', width=2),
+        hovertemplate='Frame %{x}: %{y:.3f} m<extra></extra>',
     ), row=1, col=1)
-    
-    # Show interpolated/cleaned regions - IMPROVED VISUALIZATION
-    if show_interpolation and interpolation_ranges:
-        # Highlight interpolated points with markers
-        interp_x = []
-        interp_y = []
-        for (start, end) in interpolation_ranges:
-            for i in range(start, end):
-                if i < len(plot_data):
-                    interp_x.append(i)
-                    interp_y.append(plot_data[i] / 1000)
-        
-        if interp_x:
-            # Add interpolated points as distinct markers
+
+    # Interpolierte Bereiche hervorheben
+    if show_interp and ranges:
+        ix, iy = [], []
+        for s, e in ranges:
+            for i in range(s, min(e, len(plot_data))):
+                ix.append(i)
+                iy.append(plot_data[i] / 1000)
+        if ix:
             fig.add_trace(go.Scatter(
-                x=interp_x,
-                y=interp_y,
-                mode='markers',
-                marker=dict(
-                    size=6,
-                    color='#a259d9',
-                    symbol='circle',
-                    line=dict(width=1, color='white')
-                ),
+                x=ix, y=iy, mode='markers',
+                marker=dict(size=5, color=OSP_PURPLE, symbol='circle',
+                            line=dict(width=1, color='white')),
                 name='Interpolierte Punkte',
-                hovertemplate='Frame: %{x}<br>Interpoliert: %{y:.2f} m<extra></extra>'
+                hovertemplate='Frame %{x}: %{y:.3f} m (interp.)<extra></extra>',
             ), row=1, col=1)
-        
-        # Add subtle vertical shading (reduced opacity)
-        for (start, end) in interpolation_ranges:
-            # Get Y-range for this interpolation
-            y_start = plot_data[start] / 1000 if start < len(plot_data) else 0
-            y_end = plot_data[min(end-1, len(plot_data)-1)] / 1000 if end > 0 else 0
-            
-            # Add a shape that only covers the interpolated Y-range (plus some margin)
-            y_min = min(y_start, y_end) - 2
-            y_max = max(y_start, y_end) + 2
-            
-            fig.add_shape(
-                type="rect",
-                x0=start, x1=end,
-                y0=y_min, y1=y_max,
-                fillcolor='#a259d9',
-                opacity=0.15,
-                line=dict(width=2, color='#a259d9', dash='dot'),
-                row=1, col=1
-            )
-            
-            # Add annotation showing the interpolation details
-            mid_x = (start + end) / 2
-            mid_y = (y_start + y_end) / 2
-            gap_size = abs(y_end - y_start)
+        for s, e in ranges:
+            y0 = plot_data[s] / 1000 if s < len(plot_data) else 0
+            y1 = plot_data[min(e - 1, len(plot_data) - 1)] / 1000
+            fig.add_shape(type="rect",
+                x0=s, x1=e,
+                y0=min(y0, y1) - 2, y1=max(y0, y1) + 2,
+                fillcolor=OSP_PURPLE, opacity=0.12,
+                line=dict(width=1, color=OSP_PURPLE, dash='dot'),
+                row=1, col=1)
             fig.add_annotation(
-                x=mid_x,
-                y=y_max + 1,
-                text=f"↕ {gap_size:.1f}m interpoliert",
-                showarrow=False,
-                font=dict(size=10, color='#a259d9'),
-                row=1, col=1
-            )
-    
-    # Mark problem areas (only if NOT showing cleaning)
-    if gaps and not show_interpolation:
-        gap_legend_added = False
-        
-        for gap in gaps:
-            idx = gap['index']
-            gap_size_m = gap['difference'] / 1000
-            
-            fig.add_vline(
-                x=idx, 
-                line_dash="dash", 
-                line_color='red',
-                line_width=2,
-                opacity=0.6,
-                row=1, col=1,
-                annotation_text=f"Fehler: {gap_size_m:.1f}m",
-                annotation_position="top"
-            )
-            
-            fig.add_vrect(
-                x0=idx-0.5, x1=idx+1.5,
-                fillcolor='red',
-                opacity=0.1,
-                line_width=0,
-                row=1, col=1
-            )
-            
-            if not gap_legend_added:
-                fig.add_trace(go.Scatter(
-                    x=[None], y=[None],
-                    mode='lines',
-                    line=dict(color='red', width=2, dash='dash'),
-                    name='Messfehler',
-                    showlegend=True
-                ), row=1, col=1)
-                gap_legend_added = True
-    
-    # Takeoff line
+                x=(s + e) / 2, y=max(y0, y1) + 3,
+                text=f"↕ {abs(y1-y0):.1f}m interpoliert",
+                showarrow=False, font=dict(size=9, color=OSP_PURPLE),
+                row=1, col=1)
+
+    # Absprung-Linie
     fig.add_hline(
-        y=takeoff_point/1000,  # Convert to meters
-        line_dash="dash", 
-        line_color=OSP_COLORS['red'],
-        line_width=2,
-        annotation_text=f"Absprung ({takeoff_point/1000:.2f}m)",
-        annotation_position="right",
-        row=1, col=1
-    )
-    
-    # Critical zones (in meters)
-    zone_11_6_start = (takeoff_point - 11000) / 1000
-    zone_11_6_end = (takeoff_point - 6000) / 1000
-    zone_6_1_start = (takeoff_point - 6000) / 1000
-    zone_6_1_end = (takeoff_point - 1000) / 1000
-    
+        y=takeoff_mm / 1000, line_dash="dash",
+        line_color=OSP_RED, line_width=2,
+        annotation_text=f"Absprung ({takeoff_mm/1000:.2f} m)",
+        annotation_position="right", row=1, col=1)
+
+    # Zonen
     fig.add_hrect(
-        y0=zone_11_6_start, y1=zone_11_6_end,
-        fillcolor=OSP_COLORS['gold'], 
-        opacity=0.15,
-        line_width=1,
-        line_color=OSP_COLORS['gold'],
-        annotation_text="Zone 11-6m vor Absprung",
-        annotation_position="left",
-        row=1, col=1
-    )
-    
+        y0=(takeoff_mm - 11000) / 1000, y1=(takeoff_mm - 6000) / 1000,
+        fillcolor=OSP_GOLD, opacity=0.12,
+        line_width=1, line_color=OSP_GOLD,
+        annotation_text="Zone 11-6m", annotation_position="left",
+        row=1, col=1)
     fig.add_hrect(
-        y0=zone_6_1_start, y1=zone_6_1_end,
-        fillcolor=OSP_COLORS['red'], 
-        opacity=0.12,
-        line_width=1,
-        line_color=OSP_COLORS['red'],
-        annotation_text="Zone 6-1m vor Absprung (KRITISCH)",
-        annotation_position="left",
-        row=1, col=1
-    )
-    
-    # Velocity profile (from interpolated data if available)
+        y0=(takeoff_mm - 6000) / 1000, y1=(takeoff_mm - 1000) / 1000,
+        fillcolor=OSP_RED, opacity=0.10,
+        line_width=1, line_color=OSP_RED,
+        annotation_text="Zone 6-1m (kritisch)", annotation_position="left",
+        row=1, col=1)
+
+    # Geschwindigkeit
     velocities = analyzer.calculate_velocity(list(plot_data))
-    v_plot = np.array(velocities)
-    nans = np.isnan(v_plot)
+    v = np.array(velocities, dtype=float)
+    nans = np.isnan(v)
     if np.any(~nans):
         if np.any(nans):
-            v_plot[nans] = np.interp(
-                np.flatnonzero(nans), 
-                np.flatnonzero(~nans), 
-                v_plot[~nans]
-            )
-        
+            v[nans] = np.interp(np.flatnonzero(nans), np.flatnonzero(~nans), v[~nans])
         fig.add_trace(go.Scatter(
-            y=v_plot, 
-            name='Geschwindigkeit', 
-            line=dict(color='green', width=2),
-            hovertemplate='Frame: %{x}<br>Geschw.: %{y:.2f} m/s<extra></extra>'
+            y=v, name='Geschwindigkeit',
+            line=dict(color='seagreen', width=2),
+            hovertemplate='Frame %{x}: %{y:.2f} m/s<extra></extra>',
         ), row=2, col=1)
-        
-        # Mark interpolated regions in velocity profile too
-        if show_interpolation and interpolation_ranges:
-            for (start, end) in interpolation_ranges:
-                # Highlight velocity values in interpolated region
-                if start < len(v_plot) and end <= len(v_plot):
-                    interp_v_x = list(range(start, min(end, len(v_plot))))
-                    interp_v_y = [v_plot[i] for i in interp_v_x if i < len(v_plot)]
-                    
-                    if interp_v_y:
-                        fig.add_trace(go.Scatter(
-                            x=interp_v_x,
-                            y=interp_v_y,
-                            mode='markers',
-                            marker=dict(size=4, color='#a259d9', symbol='circle'),
-                            name='Geschw. (interpoliert)',
-                            showlegend=False,
-                            hovertemplate='Frame: %{x}<br>Geschw. (interp.): %{y:.2f} m/s<extra></extra>'
-                        ), row=2, col=1)
-                
-                # Add light shading
-                fig.add_vrect(
-                    x0=start, x1=end,
-                    fillcolor='#a259d9',
-                    opacity=0.1,
-                    line_width=0,
-                    row=2, col=1
-                )
-        
-        # Mean velocity line
-        mean_vel = np.nanmean(velocities)
+        if show_interp and ranges:
+            for s, e in ranges:
+                fig.add_vrect(x0=s, x1=e,
+                    fillcolor=OSP_PURPLE, opacity=0.08, line_width=0, row=2, col=1)
+        mean_v = float(np.nanmean(v))
         fig.add_hline(
-            y=mean_vel,
-            line_dash="dash",
-            line_color='red',
-            line_width=1,
-            annotation_text=f"Ø {mean_vel:.2f} m/s",
-            annotation_position="right",
-            row=2, col=1
-        )
-    
-    # Update layout
+            y=mean_v, line_dash="dash", line_color='firebrick', line_width=1,
+            annotation_text=f"Ø {mean_v:.2f} m/s",
+            annotation_position="right", row=2, col=1)
+
     fig.update_layout(
-        title=f'{athlete_name} - Versuch {attempt_num}',
-        title_font_size=20,
-        title_font_color=OSP_COLORS['red'],
+        title=dict(text=f'{athlete} — Versuch {versuch}',
+                   font=dict(size=20, color=OSP_RED)),
         showlegend=True,
-        legend=dict(
-            orientation='h',
-            yanchor='bottom',
-            y=1.02,
-            xanchor='right',
-            x=1,
-            font=dict(size=12)
-        ),
-        height=700,
-        hovermode='x unified',
-        plot_bgcolor=OSP_COLORS['white'],
-        paper_bgcolor=OSP_COLORS['white'],
-        font=dict(family='Arial, sans-serif', size=12)
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        height=700, hovermode='x unified',
+        plot_bgcolor=OSP_WHITE, paper_bgcolor=OSP_WHITE,
+        font=dict(family='Arial, sans-serif', size=12),
     )
-    
-    fig.update_xaxes(title_text='Messpunkt', row=1, col=1, gridcolor=OSP_COLORS['light_gray'])
-    fig.update_xaxes(title_text='Messpunkt', row=2, col=1, gridcolor=OSP_COLORS['light_gray'])
-    fig.update_yaxes(title_text='Distanz (m)', row=1, col=1, gridcolor=OSP_COLORS['light_gray'])
-    fig.update_yaxes(title_text='Geschwindigkeit (m/s)', row=2, col=1, gridcolor=OSP_COLORS['light_gray'])
-    
+    fig.update_xaxes(title_text='Messpunkt', gridcolor=OSP_LGRAY)
+    fig.update_yaxes(title_text='Distanz (m)',        row=1, col=1, gridcolor=OSP_LGRAY)
+    fig.update_yaxes(title_text='Geschwindigkeit (m/s)', row=2, col=1, gridcolor=OSP_LGRAY)
     return fig
 
-def check_password():
-    """Passwortschutz für die Anwendung"""
-    def password_entered():
-        # Passwort aus Streamlit Secrets, Umgebungsvariable oder Standardwert
-        try:
-            # Versuche Streamlit Secrets zu verwenden
-            correct_password = st.secrets.get("OSP_DASHBOARD_PASSWORD", "OSP2024")
-        except:
-            # Fallback: Umgebungsvariable oder Standardwert
-            correct_password = os.environ.get("OSP_DASHBOARD_PASSWORD", "OSP2024")
-        
-        if st.session_state["password"] == correct_password:
-            st.session_state["password_correct"] = True
-            del st.session_state["password"]
-        else:
-            st.session_state["password_correct"] = False
 
-    if "password_correct" not in st.session_state:
-        st.title("OSP Anlaufanalyse Dashboard")
-        st.markdown("---")
-        st.subheader("🔐 Zugriff geschützt")
-        st.text_input("Passwort eingeben", type="password", on_change=password_entered, key="password")
-        st.info("💡 Kontaktieren Sie den Administrator für Zugangsdaten.")
-        return False
-    elif not st.session_state["password_correct"]:
-        st.title("OSP Anlaufanalyse Dashboard")
-        st.markdown("---")
-        st.subheader("🔐 Zugriff geschützt")
-        st.text_input("Passwort eingeben", type="password", on_change=password_entered, key="password")
-        st.error("❌ Falsches Passwort. Bitte versuchen Sie es erneut.")
-        return False
-    else:
-        return True
+# ── Quality metrics ───────────────────────────────────────────────────────────
 
-def read_uploaded_file(uploaded_file) -> Tuple[float, List[float], str, int]:
-    """
-    Liest eine hochgeladene .dat Datei und gibt die gleichen Daten zurück wie read_data_file
-    
-    Args:
-        uploaded_file: Streamlit UploadedFile Objekt
-        
-    Returns:
-        Tuple: (takeoff_point, data, athlete_name, attempt_num)
-    """
-    # Dateiinhalt lesen
-    content = uploaded_file.read()
-    
-    # Versuche verschiedene Encodings
-    for encoding in ['latin1', 'utf-8']:
-        try:
-            lines = content.decode(encoding).splitlines()
-            break
-        except UnicodeDecodeError:
-            continue
-    
-    # Gleiche Logik wie in MovementDataAnalyzer.read_data_file
-    athlete_name = lines[1].strip() if len(lines) > 1 else "Unbekannt"
-    attempt_num = int(lines[2].strip()) if len(lines) > 2 and lines[2].strip().isdigit() else 0
-    
-    # Takeoff-Punkt konvertieren
-    takeoff_str = lines[3].strip().replace(',', '.') if len(lines) > 3 else "0"
-    if '.' in takeoff_str:
-        takeoff_str = takeoff_str.replace('.', '')
-        takeoff_point = float(takeoff_str)
-    else:
-        takeoff_point = float(takeoff_str) if takeoff_str else 0.0
-    
-    # Daten ab Zeile 4 lesen
-    data = []
-    for line in lines[4:]:
-        line = line.strip()
-        if line:
-            try:
-                value = float(line.replace(',', '.'))
-                data.append(value)
-            except ValueError:
-                continue
-    
-    return takeoff_point, data, athlete_name, attempt_num
-
-def analyze_uploaded_file(analyzer, uploaded_file) -> Dict:
-    """
-    Analysiert eine hochgeladene Datei und gibt Gap-Analyse zurück
-    
-    Args:
-        analyzer: MovementDataAnalyzer Instanz
-        uploaded_file: Streamlit UploadedFile Objekt
-        
-    Returns:
-        Dict: Gap-Analyse ähnlich wie analyze_gaps_until_takeoff
-    """
-    # Temporäre Datei erstellen
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.dat', delete=False, encoding='latin1') as tmp_file:
-        content = uploaded_file.read()
-        # Zurückspulen für später
-        uploaded_file.seek(0)
-        
-        # Versuche verschiedene Encodings
-        for encoding in ['latin1', 'utf-8']:
-            try:
-                decoded_content = content.decode(encoding)
-                tmp_file.write(decoded_content)
-                tmp_file_path = tmp_file.name
-                break
-            except UnicodeDecodeError:
-                continue
-        
-        tmp_file_path = tmp_file.name
-    
+def quality_metrics(analyzer, data, takeoff_mm, interp_data, ranges):
     try:
-        # Verwende die normale analyze_gaps_until_takeoff Funktion
-        gap_analysis = analyzer.analyze_gaps_until_takeoff(tmp_file_path)
-        return gap_analysis
-    finally:
-        # Temporäre Datei löschen
-        if os.path.exists(tmp_file_path):
-            os.unlink(tmp_file_path)
+        arr = np.array(data, dtype=float)
+        ti = np.searchsorted(arr, takeoff_mm)
+        rel = arr[:ti] if ti > 0 else arr
+        rel_i = np.array(interp_data[:ti], dtype=float) if ti > 0 else np.array(interp_data)
+
+        if ranges and len(rel_i) > 1:
+            smooth = max(0.0, 1 - np.mean(np.abs(np.diff(np.diff(rel_i)))) / 100)
+            cont_scores = [abs(rel_i[e] - rel[e]) for s, e in ranges if e < len(rel)]
+            cont = max(0.0, 1 - np.mean(cont_scores) / max(rel)) if cont_scores else 1.0
+            iq = (smooth + cont) / 2
+        else:
+            iq = 1.0
+
+        noise = float(np.std(np.diff(rel))) if len(rel) > 1 else 0.0
+        gap_count = len(analyzer.check_for_gaps(list(rel), takeoff_mm))
+        vels = [v for v in analyzer.calculate_velocity(list(rel)) if not np.isnan(v)]
+        vel_score = max(0.0, 1 - min(np.std(vels) / 5, 1)) if vels else 0.0
+        dq = (max(0.0, 1 - min(noise / 1000, 1)) + max(0.0, 1 - min(gap_count / 5, 1)) + vel_score) / 3
+
+        sp = analyzer.analyze_step_pattern(list(rel))
+        step_stab = max(0.0, 1 - min(sp['std_step_size'] / 100, 1))
+        accs = np.diff(vels) if len(vels) > 1 else []
+        acc_stab = max(0.0, 1 - min(np.std(accs) / 2, 1)) if len(accs) else 0.0
+        ts = (step_stab + vel_score + acc_stab) / 3
+
+        return {'iq': iq, 'dq': dq, 'ts': ts, 'noise': noise, 'gaps': gap_count}
+    except Exception:
+        return {'iq': 0.5, 'dq': 0.5, 'ts': 0.5, 'noise': 0.0, 'gaps': 0}
+
+
+def zone_stats(analyzer, data, takeoff_mm, zone_far_mm, zone_near_mm):
+    try:
+        arr = np.array(data, dtype=float)
+        s = np.searchsorted(arr, takeoff_mm - zone_far_mm)
+        e = np.searchsorted(arr, takeoff_mm - zone_near_mm)
+        zd = arr[s:e]
+        if len(zd) < 2:
+            return None
+        vels = [v for v in analyzer.calculate_velocity(list(zd)) if not np.isnan(v)]
+        if not vels:
+            return None
+        steps = np.diff(zd)
+        return {
+            'mean_v': float(np.mean(vels)),
+            'std_v':  float(np.std(vels)),
+            'mean_step': float(np.mean(steps)),
+            'mean_acc': float(np.mean(np.diff(vels))) if len(vels) > 1 else 0.0,
+        }
+    except Exception:
+        return None
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+def check_password() -> bool:
+    def _entered():
+        try:
+            correct = st.secrets.get("OSP_DASHBOARD_PASSWORD", "OSP2024")
+        except Exception:
+            correct = os.environ.get("OSP_DASHBOARD_PASSWORD", "OSP2024")
+        st.session_state["auth_ok"] = (st.session_state["pw"] == correct)
+
+    if "auth_ok" not in st.session_state:
+        st.title("OSP Anlaufanalyse Dashboard")
+        st.markdown("---")
+        st.subheader("Zugriff geschützt")
+        st.text_input("Passwort", type="password", on_change=_entered, key="pw")
+        st.info("Kontakt: Administrator für Zugangsdaten.")
+        return False
+    if not st.session_state["auth_ok"]:
+        st.title("OSP Anlaufanalyse Dashboard")
+        st.markdown("---")
+        st.subheader("Zugriff geschützt")
+        st.text_input("Passwort", type="password", on_change=_entered, key="pw")
+        st.error("Falsches Passwort.")
+        return False
+    return True
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    # Passwortschutz prüfen
     if not check_password():
         return
-    
+
     # Header
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        # Try to load local logo, fallback to online version
-        logo_path = "osp_logo.png"
-        if os.path.exists(logo_path):
-            st.image(logo_path, width=200)
-        else:
-            st.image("https://osp-hessen.de/wp-content/uploads/2021/03/OSP_Logo_2021_RGB.png", width=150)
-    with col2:
+    c1, c2 = st.columns([1, 4])
+    with c1:
+        if os.path.exists("osp_logo.png"):
+            st.image("osp_logo.png", width=180)
+    with c2:
         st.title("Anlaufanalyse Dashboard")
-    
+        st.caption("OSP Hessen — Laveg-Laser Positionsdaten | Weit- und Dreisprung")
     st.markdown("---")
-    
-    # Load data
+
+    # Resources
     try:
-        analyzer = load_analyzer()
-        kalman_interpolator = load_kalman_interpolator()
-        neural_interpolator = load_neural_interpolator()
-        data_cleaner = load_data_cleaner()
-        df = load_file_list(analyzer)
-    except Exception as e:
-        st.error(f"Fehler beim Laden der Daten: {e}")
-        st.info("Stelle sicher, dass die 'Input files' Ordner vorhanden sind.")
-        df = pd.DataFrame()  # Leeres DataFrame falls Fehler
-    
-    # Datei-Upload-Option
-    st.subheader("📤 Eigene Datei hochladen")
-    uploaded_file = st.file_uploader(
-        "Wählen Sie eine .dat Datei zum Analysieren",
-        type=['dat'],
-        help="Laden Sie eine .dat Datei hoch, um sie mit unseren Modellen zu analysieren."
-    )
-    
-    # Modus: Upload oder lokale Dateien
-    use_uploaded = uploaded_file is not None
-    
-    # Variablen initialisieren (werden später gesetzt)
-    takeoff_point = None
-    data = None
-    athlete_name = None
-    attempt_num = None
-    gap_analysis = None
-    selected_file = None
-    
-    # 2-Column Layout
-    col_left, col_right = st.columns([1, 2])
-    
-    with col_left:
-        if use_uploaded:
-            st.subheader("📤 Hochgeladene Datei")
-            st.info(f"📄 Datei: {uploaded_file.name}")
-            
-            # Datei analysieren
-            try:
-                takeoff_point, data, athlete_name, attempt_num = read_uploaded_file(uploaded_file)
-                uploaded_file.seek(0)  # Zurückspulen für später
-                gap_analysis = analyze_uploaded_file(analyzer, uploaded_file)
-                
-                # Erstelle ein "fake" selected_file Dict für Kompatibilität
-                num_gaps = gap_analysis['number_of_gaps']
-                num_gaps_6_1 = len(gap_analysis['gaps_6_1'])
-                num_gaps_11_6 = len(gap_analysis['gaps_11_6'])
-                
-                if num_gaps_6_1 > 0:
-                    status = 'rot'
-                    quality = 'Kritisch'
-                elif num_gaps_11_6 > 0:
-                    status = 'gelb'
-                    quality = 'Achtung'
-                elif num_gaps > 0:
-                    status = 'grün'
-                    quality = 'OK'
-                else:
-                    status = 'grün'
-                    quality = 'Sehr gut'
-                
-                selected_file = {
-                    'filepath': None,  # Wird nicht verwendet bei Upload
-                    'filename': uploaded_file.name,
-                    'folder': 'Hochgeladen',
-                    'Athlet': athlete_name,
-                    'Versuch': attempt_num,
-                    'Lücken': num_gaps,
-                    'Qualität': quality,
-                    'status': status,
-                    'takeoff_point': takeoff_point
-                }
-                
-                st.success(f"✅ {athlete_name} - Versuch {attempt_num}")
-                st.caption(f"Qualität: {quality}")
-                
-            except Exception as e:
-                st.error(f"Fehler beim Lesen der Datei: {e}")
-                st.exception(e)
-                return
-        else:
-            st.subheader("📋 Versuche")
-        
-            # Wenn keine Datei hochgeladen, zeige lokale Dateien
-            if not use_uploaded and len(df) > 0:
-                # Filters
-                with st.expander("🔍 Filter", expanded=False):
-                    quality_filter = st.multiselect(
-                        "Qualität",
-                        options=df['Qualität'].unique(),
-                        default=df['Qualität'].unique()
-                    )
-                    
-                    folder_filter = st.multiselect(
-                        "Disziplin",
-                        options=df['folder'].unique(),
-                        default=df['folder'].unique()
-                    )
-                
-                # Apply filters
-                filtered_df = df[
-                    (df['Qualität'].isin(quality_filter)) &
-                    (df['folder'].isin(folder_filter))
-                ]
-                
-                # Display table with selection
-                display_df = filtered_df[['Athlet', 'Versuch', 'Lücken', 'Qualität']].copy()
-                display_df.insert(0, 'Index', range(len(display_df)))
-                
-                # Color code quality
-                def color_quality(row):
-                    if row['Qualität'] == 'Kritisch':
-                        return ['background-color: #f8d7da'] * len(row)
-                    elif row['Qualität'] == 'Achtung':
-                        return ['background-color: #fff3cd'] * len(row)
-                    elif row['Qualität'] == 'Sehr gut':
-                        return ['background-color: #d4edda'] * len(row)
-                    else:
-                        return [''] * len(row)
-                
-                styled_df = display_df.style.apply(color_quality, axis=1)
-                
-                # Show interactive dataframe with selection
-                event = st.dataframe(
-                    styled_df,
-                    use_container_width=True,
-                    height=500,
-                    hide_index=True,
-                    on_select="rerun",
-                    selection_mode="single-row"
-                )
-                
-                # Get selected row from dataframe interaction
-                if event.selection and event.selection.rows:
-                    selected_row_idx = event.selection.rows[0]
-                    selected_file = filtered_df.iloc[selected_row_idx]
-                else:
-                    # Default to first row if nothing selected
-                    if len(filtered_df) == 0:
-                        st.warning("Keine Versuche gefunden. Bitte Filter anpassen.")
-                        return
-                    selected_file = filtered_df.iloc[0]
-                
-                st.markdown("---")
-                st.caption(f"📌 Ausgewählt: {selected_file['Athlet']} - Versuch {selected_file['Versuch']}")
-            elif not use_uploaded and len(df) == 0:
-                st.info("📤 Laden Sie eine Datei hoch oder stellen Sie sicher, dass lokale Dateien vorhanden sind.")
-                return
-            
-            # Wenn lokale Datei ausgewählt, aber noch nicht geladen
-            if not use_uploaded and selected_file is not None and data is None:
-                # Wird später im col_right Block geladen
-                pass
-    
-    with col_right:
-        # Header with interpolation method selection
-        col_header1, col_header2 = st.columns([2, 1])
-        with col_header1:
-            st.subheader("📊 Detailanalyse")
-        with col_header2:
-            interpolation_method = st.selectbox(
-                "Interpolationsmethode",
-                options=[
-                    "Keine", 
-                    "Data Cleaner (linear)", 
-                    "Data Cleaner + PCHIP",
-                    "Data Cleaner + Kalman",
-                    "Data Cleaner + SSA",
-                    "Data Cleaner + Kalman+SSA", 
-                    "Data Cleaner + Neural"
-                ],
-                index=5,  # Default: Data Cleaner + Kalman+SSA
-                help="Alle Methoden bereinigen erst Messfehler, dann interpolieren. Fokus: Daten bis zum Absprung."
-            )
-            show_interpolation = interpolation_method != "Keine"
-        
+        analyzer    = load_analyzer()
+        interpolator = load_interpolator()
+        cleaner     = load_cleaner()
+        df          = load_file_list(cleaner)
+    except Exception as ex:
+        st.error(f"Fehler beim Laden: {ex}")
+        df = pd.DataFrame()
+
+    # Batch-Upload: einzelne oder mehrere .dat-Dateien
+    with st.expander("Dateien hochladen (einzeln oder Batch)", expanded=False):
+        uploaded_files = st.file_uploader(
+            "Laveg .dat Dateien wählen (Mehrfachauswahl möglich)",
+            type=['dat'],
+            accept_multiple_files=True,
+            help="Alle Dateien werden lokal verarbeitet — keine Daten verlassen das System.",
+        )
+        if uploaded_files:
+            st.caption(f"{len(uploaded_files)} Datei(en) geladen.")
+
+    # Hochgeladene Dateien in DataFrame umwandeln und mit lokalen Dateien zusammenführen
+    upload_rows = []
+    upload_cache: Dict[str, Tuple] = {}  # filename → (takeoff_mm, data, athlete, versuch)
+
+    for uf in (uploaded_files or []):
         try:
-            # Load selected file (lokal oder hochgeladen)
-            if use_uploaded:
-                # Daten wurden bereits oben geladen
-                # uploaded_file, takeoff_point, data, athlete_name, attempt_num, gap_analysis sind bereits verfügbar
-                gaps = gap_analysis['gaps']
+            uf.seek(0)
+            t, d, a, v = parse_uploaded(uf)
+            _, gaps_info, _ = cleaner.clean_and_interpolate(d, sampling_rate=50)
+            status, quality = classify_gaps(gaps_info, t)
+            upload_rows.append({
+                'filepath': None, 'filename': uf.name,
+                'folder': 'Upload',
+                'Athlet': a, 'Versuch': v,
+                'Lücken': len(gaps_info), 'Qualität': quality,
+                'status': status, 'takeoff_mm': t,
+            })
+            upload_cache[uf.name] = (t, d, a, v)
+        except Exception as ex:
+            st.warning(f"Konnte '{uf.name}' nicht lesen: {ex}")
+
+    # Alle Dateien (lokal + Upload) in einer Liste
+    if upload_rows:
+        upload_df = pd.DataFrame(upload_rows)
+        all_df = pd.concat([df, upload_df], ignore_index=True) if len(df) > 0 else upload_df
+    else:
+        all_df = df
+
+    # State
+    takeoff_mm: Optional[float] = None
+    data: Optional[List[float]] = None
+    athlete: Optional[str] = None
+    versuch: Optional[int] = None
+    selected: Optional[Dict] = None
+
+    # Layout
+    col_left, col_right = st.columns([1, 2])
+
+    with col_left:
+        st.subheader("Versuche")
+        if len(all_df) == 0:
+            st.info("Keine Dateien gefunden. Dateien hochladen oder 'Input files' Ordner befüllen.")
+            return
+
+        with st.expander("Filter", expanded=False):
+            q_opts = sorted(all_df['Qualität'].unique())
+            f_opts = sorted(all_df['folder'].unique())
+            q_filter = st.multiselect("Qualität", q_opts, q_opts)
+            f_filter = st.multiselect("Disziplin / Quelle", f_opts, f_opts)
+
+        fdf = all_df[all_df['Qualität'].isin(q_filter) & all_df['folder'].isin(f_filter)]
+        if len(fdf) == 0:
+            st.warning("Keine Versuche — Filter anpassen.")
+            return
+
+        def row_color(row):
+            colors = {'Kritisch': '#f8d7da', 'Achtung': '#fff3cd', 'Sehr gut': '#d4edda'}
+            bg = colors.get(row['Qualität'], '')
+            return [f'background-color: {bg}'] * len(row)
+
+        disp = fdf[['Athlet', 'Versuch', 'Lücken', 'Qualität', 'folder']].copy()
+        disp = disp.rename(columns={'folder': 'Quelle'})
+        event = st.dataframe(
+            disp.style.apply(row_color, axis=1),
+            use_container_width=True, height=500,
+            hide_index=True, on_select="rerun", selection_mode="single-row",
+        )
+        sel_idx = event.selection.rows[0] if event.selection and event.selection.rows else 0
+        selected = fdf.iloc[sel_idx].to_dict()
+        st.caption(f"Ausgewählt: {selected['Athlet']} — Versuch {selected['Versuch']}")
+
+    with col_right:
+        hc1, hc2 = st.columns([2, 1])
+        with hc1:
+            st.subheader("Detailanalyse")
+        with hc2:
+            method = st.selectbox(
+                "Interpolationsmethode",
+                options=METHOD_OPTIONS,
+                index=0,
+                help="Alle Methoden bereinigen zuerst Messfehler (DataCleaner), dann interpolieren.",
+            )
+
+        try:
+            # Daten laden: Upload-Cache oder lokale Datei
+            if selected is None:
+                st.info("Versuch auswählen.")
+                return
+            if selected['filepath'] is None:
+                # Aus Upload-Cache
+                if selected['filename'] not in upload_cache:
+                    st.error("Upload-Datei nicht mehr im Cache — bitte erneut hochladen.")
+                    return
+                takeoff_mm, data, athlete, versuch = upload_cache[selected['filename']]
             else:
-                # Lokale Datei laden
-                filepath = selected_file['filepath']
-                takeoff_point, data, athlete_name, attempt_num = analyzer.read_data_file(filepath)
-                gap_analysis = analyzer.analyze_gaps_until_takeoff(filepath)
-                gaps = gap_analysis['gaps']
-            
-            # Data Cleaning + Interpolation (removes measurement errors, then interpolates)
-            interpolated_data = data
-            interpolation_ranges = []
-            interpolation_info = []
-            
-            if show_interpolation:
-                try:
-                    # SCHRITT 1: Immer zuerst Data Cleaner für Messfehler-Bereinigung
-                    if data_cleaner:
-                        cleaned_data, cleaner_gaps_info, removed_indices = data_cleaner.clean_and_interpolate(
-                        data, sampling_rate=analyzer.sampling_rate or 50
-                    )
-                    else:
-                        cleaned_data = np.array(data)
-                        cleaner_gaps_info = []
-                        removed_indices = []
-                    
-                    # SCHRITT 2: Je nach Methode interpolieren
-                    # Methodenauswahl für Interpolator
-                    method_map = {
-                        "Data Cleaner (linear)": "linear",
-                        "Data Cleaner + PCHIP": "pchip",
-                        "Data Cleaner + Kalman": "kalman",
-                        "Data Cleaner + SSA": "ssa",
-                        "Data Cleaner + Kalman+SSA": "kalman_ssa",
-                        "Data Cleaner + Neural": "neural"
-                    }
-                    
-                    if interpolation_method == "Data Cleaner (linear)":
-                        # Nur Data Cleaner (lineare Interpolation bereits gemacht)
-                        interpolated_data = cleaned_data
-                    
-                        for gap in cleaner_gaps_info:
-                            interpolation_info.append({
-                                'index': gap['start_idx'],
-                                'size_mm': gap['gap_size_mm'],
-                                'size_m': gap['gap_size_mm'] / 1000,
-                                'num_points': gap['end_idx'] - gap['start_idx'],
-                                'confidence': 0.80,
-                                'method': 'Linear (Data Cleaner)',
-                                'start_idx': gap['start_idx'],
-                                'end_idx': gap['end_idx'],
-                                'removed_points': gap.get('removed_points', 0)
-                            })
-                            interpolation_ranges.append((gap['start_idx'], gap['end_idx']))
-                    
-                    elif interpolation_method in ["Data Cleaner + PCHIP", "Data Cleaner + Kalman", 
-                                                   "Data Cleaner + SSA", "Data Cleaner + Kalman+SSA"]:
-                        # Methode aus Map holen
-                        interp_method = method_map.get(interpolation_method, "kalman_ssa")
-                        method_display = {
-                            "pchip": "PCHIP (Monoton)",
-                            "kalman": "Kalman Filter",
-                            "ssa": "SSA (Muster)",
-                            "kalman_ssa": "Kalman+SSA Hybrid"
-                        }.get(interp_method, interp_method)
-                        
-                        if not kalman_interpolator:
-                            st.warning(f"Interpolator nicht verfügbar, verwende lineare Interpolation")
-                            interpolated_data = cleaned_data
-                            for gap in cleaner_gaps_info:
-                                interpolation_info.append({
-                                    'index': gap['start_idx'],
-                                    'size_mm': gap['gap_size_mm'],
-                                    'size_m': gap['gap_size_mm'] / 1000,
-                                    'num_points': gap['end_idx'] - gap['start_idx'],
-                                    'confidence': 0.70,
-                                    'method': 'Linear (Fallback)',
-                                    'start_idx': gap['start_idx'],
-                                    'end_idx': gap['end_idx'],
-                                    'removed_points': gap.get('removed_points', 0)
-                                })
-                                interpolation_ranges.append((gap['start_idx'], gap['end_idx']))
-                        elif cleaner_gaps_info:
-                            interpolated_data = np.array(cleaned_data)
-                            
-                            for gap in cleaner_gaps_info:
-                                start_idx = gap['start_idx']
-                                end_idx = gap['end_idx']
-                                start_value = gap['start_value']
-                                end_value = gap['end_value']
-                                gap_size_mm = abs(end_value - start_value)
-                                num_points = end_idx - start_idx
-                                
-                                # Interpolation mit gewählter Methode
-                                # WICHTIG: num_points übergeben um Sampling-Dichte zu erhalten!
-                                interp_result, confidence = kalman_interpolator.interpolate_gap(
-                                    interpolated_data, 
-                                    start_idx - 1,
-                                    end_idx,
-                                    gap_size_mm,
-                                    method=interp_method,
-                                    num_points_override=num_points  # Erhält ursprüngliche Punkt-Anzahl!
-                                )
-                                
-                                # Ersetze interpolierte Werte
-                                if len(interp_result) == num_points:
-                                    interpolated_data[start_idx:end_idx] = interp_result
-                                elif len(interp_result) > 1:
-                                    from scipy.interpolate import interp1d
-                                    x_old = np.linspace(0, 1, len(interp_result))
-                                    x_new = np.linspace(0, 1, num_points)
-                                    f = interp1d(x_old, interp_result, kind='linear')
-                                    interpolated_data[start_idx:end_idx] = f(x_new)
-                                
-                                interpolation_info.append({
-                                    'index': start_idx,
-                                    'size_mm': gap_size_mm,
-                                    'size_m': gap_size_mm / 1000,
-                                    'num_points': num_points,
-                                    'confidence': confidence,
-                                    'method': method_display,
-                                    'start_idx': start_idx,
-                                    'end_idx': end_idx,
-                                    'removed_points': gap.get('removed_points', 0)
-                                })
-                                interpolation_ranges.append((start_idx, end_idx))
-                        else:
-                            interpolated_data = cleaned_data
-                    
-                    elif interpolation_method == "Data Cleaner + Neural":
-                        # Data Cleaner hat fehlerhafte Bereiche identifiziert
-                        # JETZT: Neural ERSETZT die lineare Interpolation mit KI-basierter Interpolation
-                        
-                        if not neural_interpolator:
-                            # Fallback: Use cleaned data with linear interpolation
-                            st.warning("⚠️ Neural-Interpolator nicht verfügbar (Modell nicht trainiert), verwende lineare Interpolation")
-                            interpolated_data = cleaned_data
-                            for gap in cleaner_gaps_info:
-                                interpolation_info.append({
-                                    'index': gap['start_idx'],
-                                    'size_mm': gap['gap_size_mm'],
-                                    'size_m': gap['gap_size_mm'] / 1000,
-                                    'num_points': gap['end_idx'] - gap['start_idx'],
-                                    'confidence': 0.70,
-                                    'method': 'Linear (Fallback)',
-                                    'start_idx': gap['start_idx'],
-                                    'end_idx': gap['end_idx'],
-                                    'removed_points': gap.get('removed_points', 0)
-                                })
-                                interpolation_ranges.append((gap['start_idx'], gap['end_idx']))
-                        elif cleaner_gaps_info:
-                            # Starte mit bereinigten Daten
-                            interpolated_data = np.array(cleaned_data)
-                            
-                            for gap in cleaner_gaps_info:
-                                start_idx = gap['start_idx']
-                                end_idx = gap['end_idx']
-                                start_value = gap['start_value']
-                                end_value = gap['end_value']
-                                gap_size_mm = abs(end_value - start_value)
-                                num_points = end_idx - start_idx
-                                
-                                # Verwende Neural-Interpolation für diesen Bereich
-                                # Neural interpolate() erwartet: data, gap_start, gap_end
-                                neural_interp, confidence = neural_interpolator.interpolate(
-                                    list(interpolated_data), 
-                                    start_idx - 1,  # Index vor der Lücke
-                                    end_idx         # Index nach der Lücke
-                                )
-                                
-                                # ERSETZE die linear interpolierten Werte mit Neural-Werten
-                                # Bug fix: Check array length > 1 before interp1d
-                                if len(neural_interp) == num_points:
-                                    interpolated_data[start_idx:end_idx] = neural_interp
-                                elif len(neural_interp) > 1:
-                                    # Wenn Anzahl nicht passt, resize
-                                    from scipy.interpolate import interp1d
-                                    x_old = np.linspace(0, 1, len(neural_interp))
-                                    x_new = np.linspace(0, 1, num_points)
-                                    f = interp1d(x_old, neural_interp, kind='linear')
-                                    interpolated_data[start_idx:end_idx] = f(x_new)
-                                # else: keep cleaned_data values (already linearly interpolated)
-                                
-                                interpolation_info.append({
-                                    'index': start_idx,
-                                    'size_mm': gap_size_mm,
-                                    'size_m': gap_size_mm / 1000,
-                                    'num_points': num_points,
-                                    'confidence': confidence,
-                                    'method': 'Neural Network',
-                                    'start_idx': start_idx,
-                                    'end_idx': end_idx,
-                                    'removed_points': gap.get('removed_points', 0)
-                                })
-                                interpolation_ranges.append((start_idx, end_idx))
-                        else:
-                            # Keine Fehler gefunden, verwende bereinigte Daten
-                            interpolated_data = cleaned_data
-                    
-                except Exception as e:
-                    st.warning(f"Interpolation fehlgeschlagen ({interpolation_method}): {e}")
-                    import traceback
-                    st.error(traceback.format_exc())
-                    interpolated_data = data
-            
-            # Status badge
-            status = selected_file['status']
-            if status == 'rot':
-                badge_class = 'status-red'
-                badge_text = '🔴 KRITISCH'
-            elif status == 'gelb':
-                badge_class = 'status-yellow'
-                badge_text = '🟡 ACHTUNG'
-            else:
-                badge_class = 'status-green'
-                badge_text = '🟢 GUT'
-            
-            st.markdown(f'<div class="status-badge {badge_class}">{badge_text}</div>', unsafe_allow_html=True)
-            
-            # Gap badge with cleaning info
-            num_gaps = len(gaps)
-            if show_interpolation and interpolation_info:
-                total_removed = sum(info.get('removed_points', 0) for info in interpolation_info)
-                num_regions = len(interpolation_info)
-                avg_confidence = np.mean([info.get('confidence', 0.8) for info in interpolation_info]) if interpolation_info else 0
-                
-                method_icons = {
-                    "Data Cleaner (linear)": "🧹",
-                    "Data Cleaner + PCHIP": "📈",
-                    "Data Cleaner + Kalman": "🎯",
-                    "Data Cleaner + SSA": "🔬",
-                    "Data Cleaner + Kalman+SSA": "🏅",
-                    "Data Cleaner + Neural": "🧠"
-                }
-                icon = method_icons.get(interpolation_method, "✨")
-                
-                # Zeige Info über Bereinigung UND Interpolation
-                if "Kalman" in interpolation_method or "Neural" in interpolation_method or "PCHIP" in interpolation_method or "SSA" in interpolation_method:
-                    st.success(f"{icon} **{interpolation_method}**: {total_removed} Fehler bereinigt, {num_regions} Region(en) interpoliert (Ø Konfidenz: {avg_confidence:.0%})")
-                else:
-                    st.success(f"{icon} **{interpolation_method}**: {total_removed} Messfehler entfernt, {num_regions} Region(en) interpoliert")
-            elif num_gaps > 0:
-                st.warning(f"⚠️ {num_gaps} Datenlücke(n) / Messfehler detektiert")
-            else:
-                st.success("✅ Keine Datenlücken oder Messfehler")
-            
-            cleaning_status = interpolation_method if show_interpolation else "Original"
-            st.caption(f"Sampling Rate: {analyzer.sampling_rate} Hz | Absprung: {takeoff_point/1000:.2f}m | {cleaning_status}: {len(data)} Punkte")
-            
+                takeoff_mm, data, athlete, versuch = parse_dat(selected['filepath'])
+
+            sampling_rate = analyzer.sampling_rate or 50
+
+            # Status Badge
+            st.markdown("---")
+            badge_map = {
+                'rot':   ('status-red',    'KRITISCH'),
+                'gelb':  ('status-yellow', 'ACHTUNG'),
+                'grün':  ('status-green',  'GUT'),
+            }
+            badge_cls, badge_txt = badge_map.get(selected['status'], ('status-green', 'GUT'))
+            st.markdown(
+                f'<div class="status-badge {badge_cls}">{badge_txt}</div>',
+                unsafe_allow_html=True,
+            )
+            st.caption(
+                f"Athlet: {athlete} | Versuch: {versuch} | "
+                f"Absprung: {takeoff_mm/1000:.3f} m | Sampling: {sampling_rate} Hz"
+            )
+
+            # Interpolation ausführen
+            show_interp = (method != "Keine")
+            interp_data, interp_info, ranges = run_interpolation(
+                data, sampling_rate, method, cleaner, interpolator
+            )
+            plot_data = interp_data if show_interp else np.array(data)
+
+            # Zusammenfassung
+            if show_interp and interp_info:
+                total_removed = sum(i.get('removed_points', 0) for i in interp_info)
+                avg_conf = np.mean([i['confidence'] for i in interp_info])
+                st.success(
+                    f"**{method}**: {total_removed} Messfehler entfernt, "
+                    f"{len(interp_info)} Region(en) interpoliert "
+                    f"(Ø Konfidenz: {avg_conf:.0%})"
+                )
+            elif not interp_info:
+                st.success("Keine Messfehler oder Lücken gefunden.")
+
             # Plot
-            fig = create_plot(analyzer, data, takeoff_point, athlete_name, attempt_num, interpolated_data, interpolation_ranges, gaps, show_interpolation)
+            fig = create_plot(
+                analyzer, data, takeoff_mm, athlete, versuch,
+                plot_data, ranges, show_interp,
+            )
             st.plotly_chart(fig, use_container_width=True)
-            
-            # Metrics in 3 columns (use interpolated data if available)
-            data_for_metrics = interpolated_data if show_interpolation else data
-            metrics = calculate_quality_metrics(analyzer, data_for_metrics, takeoff_point, interpolated_data, interpolation_ranges)
-            zone_11_6 = analyze_zone(analyzer, data_for_metrics, takeoff_point, 11000, 6000)
-            zone_6_1 = analyze_zone(analyzer, data_for_metrics, takeoff_point, 6000, 1000)
-            
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.markdown("### Qualität")
-                st.metric("Interpolationsgüte", f"{metrics['interpolation_quality']:.1%}")
-                st.metric("Datenqualität", f"{metrics['data_quality']:.1%}")
-                st.metric("Stabilität", f"{metrics['technical_stability']:.1%}")
-                st.metric("Rauschlevel", f"{metrics['noise_level']:.1f} mm")
-                st.metric("Lücken", metrics['gap_count'])
-            
-            with col2:
-                st.markdown("### Zone 11-6m")
-                if zone_11_6:
-                    st.metric("Ø Geschwindigkeit", f"{zone_11_6['mean_velocity']:.2f} m/s")
-                    st.metric("Schrittlänge", f"{zone_11_6['step_length_mean']/1000:.3f} m")
-                    st.metric("Beschleunigung", f"{zone_11_6['acceleration_mean']:.2f} m/s²")
-                    st.metric("Lücken", zone_11_6['gaps'])
+
+            # Metriken
+            m = quality_metrics(analyzer, list(plot_data), takeoff_mm, plot_data, ranges)
+            z11 = zone_stats(analyzer, list(plot_data), takeoff_mm, 11000, 6000)
+            z6  = zone_stats(analyzer, list(plot_data), takeoff_mm, 6000, 1000)
+
+            mc1, mc2, mc3 = st.columns(3)
+            with mc1:
+                st.markdown("#### Qualität")
+                st.metric("Interpolationsgüte", f"{m['iq']:.1%}")
+                st.metric("Datenqualität",       f"{m['dq']:.1%}")
+                st.metric("Stabilität",          f"{m['ts']:.1%}")
+                st.metric("Rauschlevel",         f"{m['noise']:.1f} mm")
+                st.metric("Lücken",              m['gaps'])
+            with mc2:
+                st.markdown("#### Zone 11–6 m")
+                if z11:
+                    st.metric("Ø Geschwindigkeit", f"{z11['mean_v']:.2f} m/s")
+                    st.metric("Ø Schrittlänge",    f"{z11['mean_step']/1000:.3f} m")
+                    st.metric("Ø Beschleunigung",  f"{z11['mean_acc']:.2f} m/s²")
                 else:
-                    st.info("Keine Daten verfügbar")
-            
-            with col3:
-                st.markdown("### Zone 6-1m")
-                if zone_6_1:
-                    st.metric("Ø Geschwindigkeit", f"{zone_6_1['mean_velocity']:.2f} m/s")
-                    st.metric("Schrittlänge", f"{zone_6_1['step_length_mean']/1000:.3f} m")
-                    st.metric("Beschleunigung", f"{zone_6_1['acceleration_mean']:.2f} m/s²")
-                    st.metric("Lücken", zone_6_1['gaps'])
+                    st.info("Keine Daten in dieser Zone.")
+            with mc3:
+                st.markdown("#### Zone 6–1 m (kritisch)")
+                if z6:
+                    st.metric("Ø Geschwindigkeit", f"{z6['mean_v']:.2f} m/s")
+                    st.metric("Ø Schrittlänge",    f"{z6['mean_step']/1000:.3f} m")
+                    st.metric("Ø Beschleunigung",  f"{z6['mean_acc']:.2f} m/s²")
                 else:
-                    st.info("Keine Daten verfügbar")
-            
-            # Legende / Erklärungen
-            with st.expander("Legende: Begriffe und Methoden"):
+                    st.info("Keine Daten in dieser Zone.")
+
+            # Detailtabelle
+            if interp_info and show_interp:
+                st.markdown(f"#### Interpolationsdetails")
+                tbl = [{
+                    'Start':           f"Index {i['start_idx']}",
+                    'Ende':            f"Index {i['end_idx']}",
+                    'Größe (m)':       f"{i['size_m']:.2f}",
+                    'Punkte':          i['num_points'],
+                    'Fehler entfernt': i['removed_points'],
+                    'Konfidenz':       f"{i['confidence']:.0%}",
+                    'Methode':         i['method'],
+                } for i in interp_info]
+                st.dataframe(pd.DataFrame(tbl), use_container_width=True, hide_index=True)
+
+            # Legende
+            with st.expander("Methoden & Begriffe"):
                 st.markdown("""
-### Qualitätsmetriken
+#### Interpolationsmethoden
 
-Alle Metriken werden nur für den Anlauf **bis zum Absprungpunkt** berechnet.
+| Methode | Beschreibung | Konfidenz |
+|---------|-------------|-----------|
+| **Automatisch (Kalman+SSA)** | Kombiniert Kalman-Filter (Physik) mit SSA (Schrittmuster). Empfohlen für alle Fälle. | ~90% |
+| **PCHIP** | Piecewise Cubic Hermite. Mathematisch optimal, garantiert monoton. | ~95% |
+| **Kalman Filter** | Bidirektionale Zustandsschätzung (Position + Geschwindigkeit). | ~90% |
+| **SSA** | Singular Spectrum Analysis. Extrahiert Schrittmuster aus dem Kontext. | ~85% |
+| **Linear (Basis)** | Gerade Linie zwischen Start- und Endpunkt. Schnell, aber ohne Musterkenntnis. | ~80% |
+| **Keine** | Originaldaten ohne Verarbeitung. Zum Vergleich. | — |
 
-| Metrik | Beschreibung |
-|--------|--------------|
-| **Interpolationsgüte** | Bewertet die Qualität der eingefügten Datenpunkte anhand von Glattheit und Kontinuität an den Übergängen. 100% = perfekt glatt und nahtlos. |
-| **Datenqualität** | Gesamtbewertung der Rohdaten. Setzt sich zusammen aus: Rausch-Score (wie stark schwanken Schrittlängen), Lücken-Score (Anzahl Datenlücken), Geschwindigkeits-Score (Konstanz der Laufgeschwindigkeit). |
-| **Stabilität** | Technische Laufstabilität des Athleten. Bewertet: Gleichmäßigkeit der Schrittlängen, Konstanz der Geschwindigkeit, Gleichmäßigkeit der Beschleunigung. |
-| **Rauschlevel** | Standardabweichung der Schrittlängen in mm. Bei Schritt-Kontaktdaten misst dies die Variabilität der Schrittlängen, nicht Sensorrauschen. Niedrigere Werte = gleichmäßigere Schritte. |
-| **Lücken** | Anzahl erkannter Datenlücken oder Messfehler im relevanten Bereich bis zum Absprung. |
-
----
-
-### Interpolationsmethoden
-
-| Methode | Beschreibung |
-|---------|--------------|
-| **Keine** | Zeigt die unverarbeiteten Originaldaten. Zum Vergleich und zur Beurteilung der Rohdatenqualität. |
-| **Data Cleaner (linear)** | Erkennt und entfernt Messfehler. Lücken werden mit linearer Interpolation gefüllt - einer geraden Linie zwischen Start- und Endpunkt. Schnell, aber ohne Berücksichtigung von Bewegungsmustern. |
-| **Data Cleaner + PCHIP** | Piecewise Cubic Hermite Interpolating Polynomial. Garantiert monotone (nur steigende) Werte ohne Überschwinger. Mathematisch optimal für Schrittdaten. |
-| **Data Cleaner + Kalman** | Kalman Filter für physikbasierte Interpolation. Modelliert Position und Geschwindigkeit als physikalisches System. Bidirektionale Vorhersage (von beiden Seiten der Lücke). |
-| **Data Cleaner + SSA** | Singular Spectrum Analysis. Extrahiert Schrittmuster aus dem Kontext vor der Lücke und wendet diese auf die Interpolation an. Gut für periodische Bewegungen. |
-| **Data Cleaner + Kalman+SSA** | Kombiniert Kalman (Physik) mit SSA (Muster). Bei kleinen Lücken mehr Kalman, bei großen mehr SSA. Empfohlen als Standardmethode. |
-| **Data Cleaner + Neural** | Verwendet ein trainiertes LSTM-Netz zur Interpolation. Lernt Bewegungsmuster aus allen vorhandenen Daten. |
-
----
-
-### Technische Begriffe
-
-**Data Cleaner**  
-Bereinigt Bewegungsdaten von Messfehlern. Erkennt unrealistische Werte wie große Rückwärtssprünge (>500mm) und markiert diese zur Interpolation. Kleine Schwankungen werden als normales Messrauschen toleriert.
-
-**PCHIP (Piecewise Cubic Hermite Interpolating Polynomial)**  
-Mathematisch optimale Interpolation für monotone Daten. Garantiert, dass interpolierte Werte keine Überschwinger haben und immer zwischen Start- und Endwert liegen. Ideal für Schrittdaten, da Athleten nur vorwärts laufen.
-
-**Kalman Filter**  
-Mathematisches Verfahren zur Zustandsschätzung (entwickelt 1960, verwendet u.a. bei NASA). Modelliert Position und Geschwindigkeit als physikalisches System. Verwendet bidirektionale Vorhersage: Von vorne (vor der Lücke) und von hinten (nach der Lücke), dann gewichtete Kombination.
-
-**SSA (Singular Spectrum Analysis)**  
-Zeitreihenanalyse-Verfahren zur Extraktion wiederkehrender Muster. Analysiert die Schrittgrößen im Kontext vor der Lücke, extrahiert das Schrittmuster (Periodizität), und wendet dieses Muster auf die Interpolation an.
-
-**Kalman+SSA Hybrid**  
-Kombiniert beide Ansätze: Kalman liefert physikalisch plausible Grundvorhersage, SSA fügt das gelernte Schrittmuster hinzu. Gewichtung: Bei kleinen Lücken 70% Kalman / 30% SSA, bei großen Lücken 40% Kalman / 60% SSA.
-
-**Neuronales Netz (LSTM)**  
-Bidirektionales LSTM mit Attention-Mechanismus. Trainiert auf allen vorhandenen Anlaufdaten mit künstlich erzeugten Lücken (Self-Supervised Learning). Lernt typische Bewegungsmuster und kann diese zur Vorhersage nutzen.
-
-**Konfidenz**  
-Geschätzte Zuverlässigkeit der interpolierten Werte. Abhängig von Lückengröße und Methode: PCHIP ~95%, Kalman ~90%, SSA ~85%, große Lücken entsprechend niedriger.
-
----
-
-### Zonen
+#### Zonen
 
 | Zone | Bereich | Bedeutung |
 |------|---------|-----------|
-| **Zone 11-6m** | 11m bis 6m vor dem Absprung | Anlaufphase. Datenqualität hier beeinflusst die Analyse, aber weniger kritisch. |
-| **Zone 6-1m** | 6m bis 1m vor dem Absprung | Kritische Absprungvorbereitung. Datenlücken hier sind besonders problematisch für die Analyse. |
+| 11–6 m | Vor Absprung | Anlaufphase. Lücken = Warnung (gelb). |
+| 6–1 m | Vor Absprung | Kritische Phase. Lücken = Kritisch (rot). |
 
----
+#### Gap-Erkennung (DataCleaner)
 
-### Adaptive Strategie bei Kalman+SSA
-
-Die Hybrid-Methode passt die Gewichtung je nach Lückengröße an:
-
-| Lückengröße | Gewichtung | Konfidenz |
-|-------------|------------|-----------|
-| < 3m | 70% Kalman, 30% SSA | ~90% |
-| 3-6m | 50% Kalman, 50% SSA | ~80% |
-| > 6m | 40% Kalman, 60% SSA | ~70% |
-
-Bei kleinen Lücken ist die physikalische Vorhersage (Kalman) genauer. Bei großen Lücken hilft das Schrittmuster (SSA), realistische Bewegungen zu erzeugen.
+- **Rückwärtssprünge > 500 mm** unter bisherigem Maximum → Messfehler
+- **Vorwärtssprünge > 1000 mm** in einem Frame → Messausfall (Laveg-Threshold)
+- Benachbarte Fehlerbereiche (< 3 Frames) werden zusammengeführt
                 """)
-            
-            # Cleaning/Gaps details table
-            if interpolation_info and show_interpolation:
-                st.markdown(f"### Interpolationsdetails ({interpolation_method})")
-                cleaning_data = []
-                for info in interpolation_info:
-                    row = {
-                        'Start': f"Index {info.get('start_idx', info.get('index', 0))}",
-                        'Ende': f"Index {info.get('end_idx', 0)}",
-                        'Größe (m)': f"{info.get('size_m', 0):.2f}",
-                        'Punkte eingefügt': f"{info.get('num_points', 0)}",
-                        'Konfidenz': f"{info.get('confidence', 0.8):.0%}",
-                        'Methode': info.get('method', interpolation_method)
-                    }
-                    # Zeige entfernte Punkte für alle Methoden
-                    row['Fehler entfernt'] = f"{info.get('removed_points', 0)}"
-                    cleaning_data.append(row)
-                
-                st.dataframe(pd.DataFrame(cleaning_data), use_container_width=True, hide_index=True)
-            elif gaps:
-                st.markdown("### ⚠️ Erkannte Fehler/Lücken")
-                gap_data = []
-                for g in gaps:
-                    zone = ''
-                    if g.get('zone_6_1'):
-                        zone = '🔴 6-1m (kritisch)'
-                    elif g.get('zone_11_6'):
-                        zone = '🟡 11-6m'
-                    else:
-                        zone = '-'
-                    
-                    row = {
-                        'Index': g['index'],
-                        'Start (m)': f"{g['start_value']/1000:.2f}",
-                        'Ende (m)': f"{g['end_value']/1000:.2f}",
-                        'Größe (m)': f"{g['difference']/1000:.2f}",
-                        'Zone': zone
-                    }
-                    gap_data.append(row)
-                
-                st.dataframe(pd.DataFrame(gap_data), use_container_width=True, hide_index=True)
-            else:
-                st.success("✅ Keine Fehler oder Lücken detektiert!")
-        
-        except Exception as e:
-            st.error(f"Fehler beim Laden der Datei: {e}")
-            st.exception(e)
+
+        except Exception as ex:
+            st.error(f"Fehler: {ex}")
+            st.exception(ex)
+
 
 if __name__ == "__main__":
     main()
-
