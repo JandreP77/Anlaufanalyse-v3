@@ -650,7 +650,7 @@ def main():
             else:
                 takeoff_mm, data, athlete, versuch = parse_dat(selected['filepath'])
 
-            sampling_rate = analyzer.sampling_rate or 50
+            sampling_rate = 50
 
             # Status Badge
             st.markdown("---")

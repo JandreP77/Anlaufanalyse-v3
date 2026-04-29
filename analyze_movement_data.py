@@ -102,17 +102,18 @@ class MovementDataAnalyzer:
         prev_valid_velocity = None
         window_size = 5  # Use a small window for smoothing
         
+        sr = self.sampling_rate or 50
         for i in range(len(distances)-1):
             # If we have enough points, use a moving average
             if i >= window_size-1:
                 window = distances[i-window_size+1:i+2]
                 # Calculate velocity using linear regression
-                x = np.arange(len(window)) / self.sampling_rate
+                x = np.arange(len(window)) / sr
                 slope, _ = np.polyfit(x, window, 1)
                 velocity = slope / 1000  # Convert to m/s
             else:
                 delta_d = (distances[i+1] - distances[i]) / 1000  # convert to meters
-                delta_t = 1/self.sampling_rate
+                delta_t = 1/sr
                 
                 # Skip calculation if points are identical
                 if distances[i+1] == distances[i]:
