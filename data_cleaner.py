@@ -79,11 +79,21 @@ class DataCleaner:
                 continue
             forward_jump = data_array[i] - data_array[i - 1]
             if forward_jump > self.gap_threshold_mm:
-                # Markiere den Sprungpunkt und alle folgenden Punkte
-                # bis die Position wieder "erreichbar" wäre
-                # (basierend auf erwarteter Geschwindigkeit seit letztem gültigen Punkt)
                 last_valid_idx = i - 1
                 last_valid_val = data_array[last_valid_idx]
+
+                # Streuläufer-Check: liegt i-1 direkt nach einem Fehlerbereich?
+                # Dann ist i-1 selbst ein falscher Einzelpunkt (z.B. Laveg-Restwert)
+                # und der echte Anker ist der letzte gültige Punkt vor dem Fehlerbereich.
+                prev_valid = i - 2
+                while prev_valid >= 0 and not valid_mask[prev_valid]:
+                    prev_valid -= 1
+                if prev_valid >= 0 and (i - 1) - prev_valid > 1:
+                    valid_mask[i - 1] = False
+                    removed_indices.append(i - 1)
+                    last_valid_idx = prev_valid
+                    last_valid_val = data_array[prev_valid]
+
                 for j in range(i, n):
                     if not valid_mask[j]:
                         continue

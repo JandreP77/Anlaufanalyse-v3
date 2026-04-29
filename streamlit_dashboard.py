@@ -113,7 +113,8 @@ def parse_uploaded(uploaded_file) -> Tuple[float, List[float], str, int]:
 
 
 def classify_gaps(gaps_info: List[Dict], takeoff_mm: float) -> Tuple[str, str]:
-    """Gibt (status, qualität) basierend auf Zonen zurück."""
+    """Gibt (status, qualität) basierend auf Zonen zurück.
+    Lücken außerhalb der 11m-Analysezone sind für die Bewertung irrelevant."""
     zone_6_1 = [g for g in gaps_info
                 if g['start_value'] >= takeoff_mm - 6000 and g['start_value'] < takeoff_mm - 1000]
     zone_11_6 = [g for g in gaps_info
@@ -123,8 +124,6 @@ def classify_gaps(gaps_info: List[Dict], takeoff_mm: float) -> Tuple[str, str]:
         return 'rot', 'Kritisch'
     if zone_11_6:
         return 'gelb', 'Achtung'
-    if gaps_info:
-        return 'grün', 'OK'
     return 'grün', 'Sehr gut'
 
 
